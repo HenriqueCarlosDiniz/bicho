@@ -160,8 +160,8 @@ void OracleBrain::initBrain() {
 #if !defined(ARDUINO)
 // Grava os headers de autenticação num arquivo temporário lido pelo curl via "-H @arquivo",
 // para que a chave da API não apareça na linha de comando (lista de processos) nem na URL.
-static bool writeCurlAuthHeaderFile(const std::string& api_key) {
-    std::ofstream header_file(GEMINI_AUTH_HEADER_TEMP_FILE, std::ios::binary | std::ios::trunc);
+static bool writeCurlAuthHeaderFile(const std::string& header_path, const std::string& api_key) {
+    std::ofstream header_file(header_path.c_str(), std::ios::binary | std::ios::trunc);
     if (!header_file.is_open()) {
         return false;
     }
@@ -175,16 +175,18 @@ static int runCurlPostWithAuth(const std::string& api_key,
                                const char* request_file,
                                const char* response_file,
                                int timeout_sec) {
-    if (!writeCurlAuthHeaderFile(api_key)) {
+    // Um arquivo de headers por requisição: Oráculo, TTS e Diário podem rodar em paralelo
+    const std::string header_path = std::string(request_file) + GEMINI_AUTH_HEADER_SUFFIX;
+    if (!writeCurlAuthHeaderFile(header_path, api_key)) {
         return -1;
     }
     std::string curl_cmd =
         "curl -s -m " + std::to_string(timeout_sec) +
-        " -X POST -H @" + std::string(GEMINI_AUTH_HEADER_TEMP_FILE) +
+        " -X POST -H @" + header_path +
         " --data-binary @" + std::string(request_file) +
         " \"" + std::string(endpoint_url) + "\" -o " + std::string(response_file) + " >nul 2>&1";
     int exit_code = std::system(curl_cmd.c_str());
-    std::remove(GEMINI_AUTH_HEADER_TEMP_FILE);
+    std::remove(header_path.c_str());
     return exit_code;
 }
 #endif
@@ -334,8 +336,13 @@ std::string OracleBrain::buildTelemetryJsonString(const OracleContextPacket& con
         telemetry_json += "]";
     }
 
-    // Nível 3 do SD: Resumos Diários Consolidados
-    if (!daily_summaries.empty()) {
+    // Diário do Bicho: hoje até agora, ontem e esta semana (resumos reais gerados pelo DiaryService)
+    if (!context_packet.diary_context_json.empty()) {
+        telemetry_json += ",\"diary\":" + context_packet.diary_context_json;
+    }
+
+    // Nível 3 do SD (legado): Resumos Diários Consolidados — só quando o Diário ainda não tem dados
+    if (context_packet.diary_context_json.empty() && !daily_summaries.empty()) {
         telemetry_json += ",\"daily_summaries\":[";
         for (size_t i = 0; i < daily_summaries.size(); ++i) {
             if (i > 0) telemetry_json += ",";
@@ -532,7 +539,11 @@ bool OracleBrain::parseGeminiStructuredJson(const std::string& raw_api_response,
     return true;
 }
 
-bool OracleBrain::executePlatformHttpsPost(const std::string& request_payload_json, std::string& out_raw_response) const {
+bool OracleBrain::executePlatformHttpsPost(const std::string& request_payload_json,
+                                           std::string& out_raw_response,
+                                           const char* request_temp_file,
+                                           const char* response_temp_file,
+                                           int timeout_sec) const {
     std::string api_key = resolveApiKey();
     if (api_key.empty()) {
         return false;
@@ -558,7 +569,9 @@ bool OracleBrain::executePlatformHttpsPost(const std::string& request_payload_js
 
     http_client.addHeader("Content-Type", "application/json");
     http_client.addHeader("x-goog-api-key", api_key.c_str());
-    http_client.setTimeout(8500);
+    http_client.setTimeout(static_cast<uint16_t>(timeout_sec * 1000));
+    (void)request_temp_file;
+    (void)response_temp_file;
     int http_code = http_client.POST(request_payload_json.c_str());
     if (http_code == HTTP_CODE_OK) {
         String response_str = http_client.getString();
@@ -571,21 +584,21 @@ bool OracleBrain::executePlatformHttpsPost(const std::string& request_payload_js
 #else
     // No Emulador de PC (native_pc): grava gemini_req.json e invoca curl via linha de comando
     {
-        std::ofstream req_file(GEMINI_REQ_TEMP_FILE, std::ios::binary | std::ios::trunc);
+        std::ofstream req_file(request_temp_file, std::ios::binary | std::ios::trunc);
         if (!req_file.is_open()) {
             return false;
         }
         req_file.write(request_payload_json.data(), static_cast<std::streamsize>(request_payload_json.size()));
     }
 
-    std::remove(GEMINI_RESP_TEMP_FILE);
+    std::remove(response_temp_file);
 
-    int exit_code = runCurlPostWithAuth(api_key, endpoint_url, GEMINI_REQ_TEMP_FILE, GEMINI_RESP_TEMP_FILE, 15);
+    int exit_code = runCurlPostWithAuth(api_key, endpoint_url, request_temp_file, response_temp_file, timeout_sec);
     if (exit_code != 0) {
         return false;
     }
 
-    std::ifstream resp_file(GEMINI_RESP_TEMP_FILE, std::ios::binary);
+    std::ifstream resp_file(response_temp_file, std::ios::binary);
     if (!resp_file.is_open()) {
         return false;
     }
@@ -918,6 +931,21 @@ bool OracleBrain::pollCompletedResponse(OracleBrainResponse& out_response) {
         rememberConversationTurn(out_response.user_said, out_response.reply_text);
     }
     return true;
+}
+
+bool OracleBrain::requestTextCompletion(const std::string& system_instruction,
+                                        const std::string& user_text,
+                                        std::string& out_raw_response) const {
+    std::string payload = "{";
+    payload += "\"system_instruction\":{\"parts\":[{\"text\":\"" + escapeJsonString(system_instruction) + "\"}]},";
+    payload += "\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"" + escapeJsonString(user_text) + "\"}]}],";
+    payload += "\"generationConfig\":{\"response_mime_type\":\"application/json\",\"temperature\":0.4,\"maxOutputTokens\":600}";
+    payload += "}";
+    return executePlatformHttpsPost(payload, out_raw_response, GEMINI_DIARY_REQ_TEMP_FILE, GEMINI_DIARY_RESP_TEMP_FILE, 25);
+}
+
+const std::string& OracleBrain::getLastTriggerReason() const {
+    return trigger_reason;
 }
 
 bool OracleBrain::wasRecentlySpoken(const std::string& phrase) const {

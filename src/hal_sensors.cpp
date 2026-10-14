@@ -209,6 +209,8 @@ HalSensors::HalSensors()
     sd_config.time_scale = 1.0f;
     sd_config.speaker_volume = 175;
     sd_config.morning_briefing_enabled = true;
+    sd_config.diary_enabled = true;
+    sd_config.diary_store_transcripts = true;
     std::memset(pip_frame_gray, 0, sizeof(pip_frame_gray));
     std::memset(pip_hd_frame_gray, 0, sizeof(pip_hd_frame_gray));
     std::memset(pip_frame_rgb565, 0, sizeof(pip_frame_rgb565));
@@ -271,6 +273,8 @@ bool HalSensors::loadOrInitSdConfig() {
             cfg_doc["time_scale"] = sd_config.time_scale;
             cfg_doc["speaker_volume"] = sd_config.speaker_volume;
             cfg_doc["morning_briefing_enabled"] = sd_config.morning_briefing_enabled;
+            cfg_doc["diary_enabled"] = sd_config.diary_enabled;
+            cfg_doc["diary_store_transcripts"] = sd_config.diary_store_transcripts;
             std::string cfg_text;
             serializeJsonPretty(cfg_doc, cfg_text);
             std::fwrite(cfg_text.data(), 1, cfg_text.size(), wf);
@@ -312,6 +316,22 @@ bool HalSensors::loadOrInitSdConfig() {
     int volume = cfg_doc["speaker_volume"] | static_cast<int>(sd_config.speaker_volume);
     sd_config.speaker_volume = static_cast<uint8_t>(volume < 0 ? 0 : (volume > 255 ? 255 : volume));
     sd_config.morning_briefing_enabled = cfg_doc["morning_briefing_enabled"] | sd_config.morning_briefing_enabled;
+    sd_config.diary_enabled = cfg_doc["diary_enabled"] | sd_config.diary_enabled;
+    sd_config.diary_store_transcripts = cfg_doc["diary_store_transcripts"] | sd_config.diary_store_transcripts;
+
+    // Atualiza config.json antigos com as chaves novas (valores padrão), para a opção ficar visível
+    if (cfg_doc["diary_enabled"].isNull() || cfg_doc["diary_store_transcripts"].isNull()) {
+        cfg_doc["diary_enabled"] = sd_config.diary_enabled;
+        cfg_doc["diary_store_transcripts"] = sd_config.diary_store_transcripts;
+        std::string upgraded;
+        serializeJsonPretty(cfg_doc, upgraded);
+        FILE* uf = std::fopen(SD_CONFIG_FILE_PATH, "w");
+        if (uf != nullptr) {
+            std::fwrite(upgraded.data(), 1, upgraded.size(), uf);
+            std::fclose(uf);
+            M5_LOGI("[SD-CFG] '%s' atualizado com as opcoes do Diario (diary_enabled, diary_store_transcripts).", SD_CONFIG_FILE_PATH);
+        }
+    }
 
     M5_LOGI("[SD-CFG] Configuracao carregada de '%s' (Lat=%.2f, Lon=%.2f, Vol=%u, Briefing=%s)",
             SD_CONFIG_FILE_PATH,

@@ -37,7 +37,9 @@ constexpr const char* GEMINI_TTS_API_ENDPOINT =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent";
 
 constexpr const char* GEMINI_REQ_TEMP_FILE = "gemini_req.json";
-constexpr const char* GEMINI_AUTH_HEADER_TEMP_FILE = "gemini_auth_headers.txt"; // Header x-goog-api-key do curl (apagado após uso)
+constexpr const char* GEMINI_AUTH_HEADER_SUFFIX = ".hdr"; // Header x-goog-api-key do curl (<requisição>.hdr, apagado após uso)
+constexpr const char* GEMINI_DIARY_REQ_TEMP_FILE = "gemini_diary_req.json";
+constexpr const char* GEMINI_DIARY_RESP_TEMP_FILE = "gemini_diary_resp.json";
 constexpr const char* GEMINI_RESP_TEMP_FILE = "gemini_resp.json";
 constexpr const char* ORACLE_MEMORY_SAVE_FILE = "oracle_memories.json";
 constexpr const char* ORACLE_MEMORY_NVS_NAMESPACE = "bicho_mem";
@@ -110,6 +112,8 @@ constexpr const char* ORACLE_SYSTEM_PROMPT =
     "e então RESPONDA AO CONTEÚDO dessa fala (pergunta -> resposta útil e com humor; pedido -> atenda; comentário -> reaja a ele). "
     "Nesses casos ignore trivia, manchetes, Pokémon/Magic e cotações, a não ser que ele pergunte sobre isso. "
     "Se não deu para entender o áudio, peça com graça para ele repetir em vez de inventar. Sem áudio, deixe 'user_said' vazio. "
+    "Use 'diary' (resumo de hoje até agora, de ontem e da semana) para ter noção do que já aconteceu, perceber padrões e "
+    "dar continuidade (ex.: 'terceiro dia seguido sem pausa'); não recite o diário. "
     "Use 'recent_conversation' (as últimas trocas por voz, com quanto tempo atrás) para manter o fio da conversa: "
     "lembre do que ele perguntou antes, responda a perguntas de continuação ('e amanhã?', 'explica melhor') e não se repita. "
     "Responda EXCLUSIVAMENTE em JSON válido (application/json) com a estrutura exata: "
@@ -168,6 +172,7 @@ struct OracleContextPacket {
     std::string jpeg_base64;        // Snapshot opcional da câmera GC0308/Webcam em Base64
     std::string wav_base64;         // Trecho opcional de áudio em Base64
     std::string prebuilt_telemetry_json; // Telemetria+memória serializada no loop principal (a thread de rede não lê estado compartilhado)
+    std::string diary_context_json;      // Objeto JSON do Diário (hoje até agora / ontem / semana), montado pelo DiaryService
 };
 
 struct OracleBrainResponse {
@@ -219,7 +224,11 @@ private:
     std::string escapeJsonString(const std::string& raw_str) const;
     std::string buildTelemetryJsonString(const OracleContextPacket& context_packet) const;
     std::string buildGeminiRequestPayload(const OracleContextPacket& context_packet) const;
-    bool executePlatformHttpsPost(const std::string& request_payload_json, std::string& out_raw_response) const;
+    bool executePlatformHttpsPost(const std::string& request_payload_json,
+                                  std::string& out_raw_response,
+                                  const char* request_temp_file = GEMINI_REQ_TEMP_FILE,
+                                  const char* response_temp_file = GEMINI_RESP_TEMP_FILE,
+                                  int timeout_sec = 15) const;
     bool extractJsonStringField(const std::string& json_src, const char* field_key, std::string& out_val) const;
     bool extractJsonIntField(const std::string& json_src, const char* field_key, int32_t& out_val) const;
     std::string truncateUtf8Reply(const std::string& text_utf8, size_t max_chars) const;
@@ -270,6 +279,14 @@ public:
                                 const std::string& trigger_name);
     const std::vector<std::string>& getRecentMemories() const;
     bool wasRecentlySpoken(const std::string& phrase) const;
+
+    // Chamada de texto puro ao Gemini (resposta JSON), bloqueante: usada pela thread do Diário
+    bool requestTextCompletion(const std::string& system_instruction,
+                               const std::string& user_text,
+                               std::string& out_raw_response) const;
+
+    // Motivo do último gatilho enviado ao Cérebro (para registrar a resposta no Diário)
+    const std::string& getLastTriggerReason() const;
     const std::vector<std::string>& getPermanentProfileFacts() const;
     uint32_t getTotalEpisodicRecords() const;
     bool isSdStorageReady() const;

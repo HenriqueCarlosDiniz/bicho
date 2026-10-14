@@ -23,7 +23,9 @@ gemini_req.json
 gemini_resp.json
 gemini_tts_req.json
 gemini_tts_resp.json
-gemini_auth_headers.txt
+*.json.hdr
+gemini_diary_req.json
+gemini_diary_resp.json
 cam_snap.jpg
 cam_snap_tmp.jpg
 face_track.txt

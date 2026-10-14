@@ -194,6 +194,8 @@ struct SdSystemConfig {
     float time_scale;               // Multiplicador de velocidade biológica
     uint8_t speaker_volume;         // Volume do alto-falante (0 a 255)
     bool morning_briefing_enabled;  // Dispara resumo matinal automático ao sincronizar mundo externo
+    bool diary_enabled;             // Diário do Bicho: eventos + resumos de capítulo/dia/semana no SD
+    bool diary_store_transcripts;   // Grava no Diário o texto do que o humano disse por voz (false = só os temas)
 };
 
 struct PersistentPetData {

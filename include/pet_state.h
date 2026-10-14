@@ -8,6 +8,7 @@
 #include "oracle_brain.h"
 #include "world_context.h"
 #include "voice_synth_worker.h"
+#include "diary_service.h"
 
 // =============================================================================
 // Constantes de Tempo e Limiares da Máquina de Estados (Padrão UPPER_CASE)
@@ -285,7 +286,10 @@ private:
     uint32_t sfx_playback_until_ms;     // Fim do efeito sonoro atual: depois dele o barramento volta ao microfone
     std::string pending_voice_wav_b64;
 
-    // 7. Síntese de voz assíncrona (fora do loop de 60 FPS). Declarado após oracle_brain para ser destruído antes dele.
+    // 7. Diário do Bicho (eventos + resumos no SD). Declarado após oracle_brain para ser destruído antes dele.
+    DiaryService diary_service;
+
+    // 8. Síntese de voz assíncrona (fora do loop de 60 FPS). Declarado após oracle_brain para ser destruído antes dele.
     VoiceSynthWorker voice_worker;
     uint32_t voice_job_id;
     bool awaiting_voice;

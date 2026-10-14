@@ -106,6 +106,7 @@ PetController::PetController()
       shift_debrief_done_today(false),
       debrief_overlay_until_ms(0),
       pending_voice_until_ms(0),
+      diary_service(),
       sfx_playback_until_ms(0),
       pending_voice_wav_b64(),
       voice_worker(),
@@ -213,6 +214,8 @@ void PetController::initController() {
 void PetController::restorePersistentState(HalSensors& hal_sensors) {
     const SdSystemConfig& sd_cfg = hal_sensors.getSdConfig();
     world_context_service.setLocation(sd_cfg.latitude, sd_cfg.longitude);
+    diary_service.init(&oracle_brain, sd_cfg.diary_enabled, sd_cfg.diary_store_transcripts);
+    diary_service.logEvent("SESSION_START", "Bicho ligado na mesa");
     oracle_brain.loadMemoriesFromStorage();
     PersistentPetData loaded_data = {
         internal_stats.hunger_level,
@@ -415,12 +418,14 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         if (pomodoro_active) {
             pomodoro_end_ms = now_ms + (25U * 60U * 1000U); // 25 minutos reais de missão de combate
             M5_LOGI("[POMODORO] Missao de Foco Tatico iniciada (25 min)!");
+            diary_service.logEvent("POMODORO", "Iniciou um pomodoro de 25 min");
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_pomodoro_start.wav").c_str());
             if (!oracle_brain.isWaitingAi()) {
                 triggerSarcasticOracle(hal_sensors, "POMODORO_START");
             }
         } else {
             M5_LOGI("[POMODORO] Missao de Foco Tatico cancelada pelo usuario.");
+            diary_service.logEvent("POMODORO", "Abandonou o pomodoro antes do fim");
             oracle_brain.recordHabitPomodoroResult(false);
             speakWithLipSync(hal_sensors, "Missão Pomodoro abortada! Fugindo do foco tão cedo?");
         }
@@ -429,6 +434,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     if (pomodoro_active && now_ms >= pomodoro_end_ms) {
         pomodoro_active = false;
         M5_LOGI("[POMODORO] Missao de Foco Tatico de 25 min concluida!");
+        diary_service.logEvent("POMODORO", "Concluiu um pomodoro de 25 min");
         oracle_brain.recordHabitPomodoroResult(true);
         oracle_brain.saveEventSnapshotToSd("POMODORO_DONE");
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_pomodoro_fanfare.wav").c_str());
@@ -576,6 +582,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     // 2.25. Recompensa Instantânea de Git Commit (transição de prev_git_modified_files > 0 para 0)
     if (prev_git_modified_files > 0U && env_data.git_modified_files == 0U) {
         git_commits_today++;
+        diary_service.logEvent("GIT_COMMIT", "Fez um commit (" + std::to_string(git_commits_today) + "º de hoje)");
         oracle_brain.addXpPoints(50);
         internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 10, 0, MAX_STAT_VALUE);
         current_emotion = EMOTION_HAPPY;
@@ -743,10 +750,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             spawnHudPopup("MODO SILENCIO", 120.0f, 44.0f, COLOR_CYBER_ORANGE, 1800U);
             stopSpeakingImmediately(hal_sensors, "[MODO SILÊNCIO ATIVO — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU JOINHA P/ SOM)]");
             M5_LOGI("[SILENCIO] Modo Silencio Indefinido ATIVADO via tecla [Q]! Interacao por texto mantida.");
+            diary_service.logEvent("SILENCE", "Pediu silêncio ao Bicho");
         } else {
             current_emotion = EMOTION_HAPPY;
             emotion_lock_until_ms = now_ms + 3500U;
             spawnHudPopup("VOZ ATIVA!", 126.0f, 44.0f, COLOR_CYBER_GREEN, 1800U);
+            diary_service.logEvent("SILENCE", "Reativou a voz do Bicho");
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             static const char* const UNMUTE_PHRASES[] = {
                 "Modo silêncio encerrado! Voz tática do Bicho reativada na bancada.",
@@ -763,6 +772,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     if (gaze_data.gesture_thumbs_up && is_muted_indefinitely && (now_ms - last_hand_gesture_react_ms > 3500U)) {
         last_hand_gesture_react_ms = now_ms;
         is_muted_indefinitely = false; // Joinha encerra o modo silêncio indefinido!
+        diary_service.logEvent("SILENCE", "Reativou a voz do Bicho com um joinha");
         pip_display_until_ms = now_ms + 5500U;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 5000U;
@@ -801,6 +811,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             spawnHudPopup("PALMA: SILENCIO", 114.0f, 44.0f, COLOR_CYBER_ORANGE, 1900U);
             stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU JOINHA P/ SOM)]");
             M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP/SILENCIO) detectada! Modo Silencio Indefinido ativado.");
+            diary_service.logEvent("SILENCE", "Pediu silêncio ao Bicho com a palma da mão");
         }
     }
     // Atalhos de teclado dedicados ([K] Selfie Vitória):
@@ -968,6 +979,15 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         }
     }
 
+    // 3.0. Diário: virada de dia, capítulos e resumos prontos (fatos duradouros vão para o perfil permanente)
+    {
+        std::vector<std::string> lasting_facts;
+        diary_service.update(now_ms, oracle_brain.isWaitingAi(), lasting_facts);
+        for (const std::string& fact : lasting_facts) {
+            oracle_brain.addPermanentProfileFact(fact);
+        }
+    }
+
     // 3.1. Coleta resposta assíncrona do Cérebro (Gemini Flash-Lite ou Fallback Offline) quando pronta
     // Não fala por cima do usuário: segura a resposta enquanto o VAD mede uma frase em andamento
     // (se essa frase virar uma nova pergunta, a nova consulta substitui a resposta retida)
@@ -1018,6 +1038,18 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             );
         }
 
+        // Diário: registra a interação (voz com transcrição conforme config; demais gatilhos pelo fato observado)
+        if (std::strcmp(payload.reply_text, "IGNORE") != 0 && std::strcmp(payload.reply_text, "[IGNORE]") != 0) {
+            const std::string& reason = oracle_brain.getLastTriggerReason();
+            if (reason == "VOICE_HANDS_FREE" || reason == "VOICE_COMMAND") {
+                diary_service.logConversation(brain_result.user_said, payload.reply_text, brain_result.memory_tags);
+            } else if (!brain_result.new_memory.empty()) {
+                diary_service.logEvent(reason.c_str(), brain_result.new_memory);
+            } else {
+                diary_service.logEvent(reason.c_str(), std::string("Bicho comentou: \"") + payload.reply_text + "\"");
+            }
+        }
+
         applyOracleResponse(hal_sensors, payload);
     }
 
@@ -1033,6 +1065,10 @@ void PetController::updatePresenceAndFocus(const GazeTargetData& gaze_data, cons
     // Retorno imediato de ausência: acorda animado ao rever o usuário
     if (gaze_data.face_detected && !was_user_present) {
         was_user_present = true;
+        if (internal_stats.absence_minutes >= 2U) {
+            diary_service.logEvent("RETURN", "Voltou à mesa depois de " +
+                                   std::to_string(internal_stats.absence_minutes) + " min fora");
+        }
         internal_stats.absence_minutes = 0;
         if (current_emotion == EMOTION_SLEEPING || current_emotion == EMOTION_SLEEPY) {
             current_emotion = EMOTION_HAPPY;
@@ -1063,6 +1099,10 @@ void PetController::updatePresenceAndFocus(const GazeTargetData& gaze_data, cons
                 // Usuário presente e em silêncio -> incrementa contador de foco livremente e matriz de hábitos no SD
                 internal_stats.focus_minutes++;
                 oracle_brain.recordHabitFocusMinute();
+                if (internal_stats.focus_minutes % 30U == 0U) {
+                    diary_service.logEvent("FOCUS", "Acumulou " + std::to_string(internal_stats.focus_minutes) +
+                                           " min de foco na sessão");
+                }
                 if (internal_stats.meeting_minutes > 0) {
                     internal_stats.meeting_minutes--;
                 }
@@ -1073,6 +1113,9 @@ void PetController::updatePresenceAndFocus(const GazeTargetData& gaze_data, cons
         } else {
             // Usuário ausente (sem rosto detectado)
             internal_stats.absence_minutes++;
+            if (internal_stats.absence_minutes == 2U) {
+                diary_service.logEvent("LEAVE", "Saiu da mesa");
+            }
             if (internal_stats.focus_minutes > 0) {
                 internal_stats.focus_minutes--;
             }
@@ -1248,6 +1291,7 @@ void PetController::triggerSarcasticOracle(HalSensors& hal_sensors, const char* 
     context_packet.trigger_reason = (custom_reason != nullptr) ? custom_reason : "TOUCH_POKE";
     context_packet.external_world_summary = world_context_service.buildExternalWorldSummary();
     context_packet.host_and_posture_summary = host_posture_buf;
+    context_packet.diary_context_json = diary_service.buildContextJson();
 
 #if defined(ARDUINO)
     // No hardware real M5Stack CoreS3, captura o frame JPEG 320x240 diretamente da câmera GC0308 ativa no HalSensors
