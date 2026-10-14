@@ -238,7 +238,7 @@ bool PetController::loadVoiceWavForPlayback(std::vector<uint8_t>& synthesized_wa
 void PetController::beginLipSyncPlayback(uint32_t now_ms) {
     awaiting_voice = false;
     // A legenda é redigitada junto com a fala (o texto completo ficou visível só durante a síntese)
-    lip_sync_state.visible_text[0] = ' ';
+    lip_sync_state.visible_text[0] = '\0';
     lip_sync_state.current_char_index = 0;
     playback_start_ms = now_ms;
     lip_sync_state.next_char_timestamp_ms = now_ms;
@@ -481,9 +481,9 @@ void PetController::updateLipSyncStep(HalSensors& hal_sensors, uint32_t now_ms) 
             beginLipSyncPlayback(now_ms);
         } else {
             // Enquanto a voz é sintetizada, a resposta já aparece inteira na tela (o Bicho "reagiu")
-            if (lip_sync_state.visible_text[0] == ' ') {
+            if (lip_sync_state.visible_text[0] == '\0') {
                 std::strncpy(lip_sync_state.visible_text, lip_sync_state.full_text, DIALOGUE_MAX_LEN - 1);
-                lip_sync_state.visible_text[DIALOGUE_MAX_LEN - 1] = ' ';
+                lip_sync_state.visible_text[DIALOGUE_MAX_LEN - 1] = '\0';
             }
             target_pose.mouth_open_height = MOUTH_CLOSED_HEIGHT;
             return;

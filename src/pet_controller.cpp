@@ -601,17 +601,22 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
 
     // 2.28. Consulta relógio local para o Ritual de Encerramento de Expediente (18:30 automático ou Palma após 17:30)
     std::time_t now_epoch = std::time(nullptr);
-    const std::tm* local_tm = std::localtime(&now_epoch);
+    std::tm local_tm_buf = {};
+#if defined(_WIN32)
+    const bool has_local_tm = (localtime_s(&local_tm_buf, &now_epoch) == 0);
+#else
+    const bool has_local_tm = (localtime_r(&now_epoch, &local_tm_buf) != nullptr);
+#endif
     bool is_after_1730 = false;
-    if (local_tm != nullptr) {
-        if (local_tm->tm_hour < 12 && shift_debrief_done_today) {
+    if (has_local_tm) {
+        if (local_tm_buf.tm_hour < 12 && shift_debrief_done_today) {
             shift_debrief_done_today = false;
             git_commits_today = 0;
         }
-        is_after_1730 = (local_tm->tm_hour > 17) || (local_tm->tm_hour == 17 && local_tm->tm_min >= 30);
+        is_after_1730 = (local_tm_buf.tm_hour > 17) || (local_tm_buf.tm_hour == 17 && local_tm_buf.tm_min >= 30);
         if (!shift_debrief_done_today &&
-            local_tm->tm_hour == 18 &&
-            local_tm->tm_min == 30 &&
+            local_tm_buf.tm_hour == 18 &&
+            local_tm_buf.tm_min == 30 &&
             gaze_data.face_detected &&
             internal_stats.focus_minutes >= 15) {
             shift_debrief_done_today = true;

@@ -42,7 +42,11 @@ public:
 
 private:
     void runLoop();
-    bool synthesizeWithCache(const std::string& text_utf8, std::vector<uint8_t>& out_wav) const;
+    bool synthesizeWithCache(const std::string& text_utf8,
+                             std::vector<uint8_t>& preloaded_wav,
+                             std::vector<uint8_t>& out_wav,
+                             std::string& out_cache_path,
+                             std::vector<uint8_t>& out_raw_wav_for_cache) const;
 
     const OracleBrain* oracle_brain;
     WavDspFn dsp_fn;
@@ -53,11 +57,14 @@ private:
     bool has_request;
     std::string request_text;
     PetEmotionState request_emotion;
+    std::vector<uint8_t> request_cached_wav;
     uint32_t request_id;
     uint32_t next_job_id;
     uint32_t done_id;
     bool done_ok;
     std::vector<uint8_t> done_wav;
+    std::string done_cache_path;
+    std::vector<uint8_t> done_raw_wav_for_cache;
 };
 
 #endif // VOICE_SYNTH_WORKER_H
