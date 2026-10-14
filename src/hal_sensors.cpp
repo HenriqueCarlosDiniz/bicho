@@ -1293,6 +1293,22 @@ bool HalSensors::hasValidPipRgb565Frame() const {
     return has_valid_pip_rgb565;
 }
 
+bool HalSensors::isTypingActive() const {
+    return audio_data.is_typing_active;
+}
+
+float HalSensors::getTypingClickRate() const {
+    return audio_data.typing_click_rate;
+}
+
+bool HalSensors::isMusicActive() const {
+    return audio_data.is_music_active;
+}
+
+uint32_t HalSensors::getMusicBeatIntervalMs() const {
+    return (audio_data.music_beat_interval_ms > 150U) ? audio_data.music_beat_interval_ms : 500U;
+}
+
 // =============================================================================
 // Implementação Exclusiva para Hardware Real: ESP32-S3 (M5Stack CoreS3)
 // =============================================================================
@@ -1640,7 +1656,18 @@ void HalSensors::readCoreS3Microphone() {
         audio_data.adaptive_noise_floor_db = dsp_noise_floor_db;
         audio_data.spectral_zcr = dsp_latest_zcr;
         audio_data.is_typing_cadence = (current_ms < dsp_typing_active_until_ms);
+        audio_data.is_typing_active = audio_data.is_typing_cadence;
+        if (audio_data.is_typing_active) {
+            float elapsed_sec = static_cast<float>(current_ms - dsp_typing_window_start_ms) * 0.001f;
+            if (elapsed_sec < 0.35f) elapsed_sec = 0.35f;
+            float rate = static_cast<float>(dsp_typing_click_count) / elapsed_sec;
+            audio_data.typing_click_rate = fminf(18.0f, fmaxf(2.0f, rate));
+        } else {
+            audio_data.typing_click_rate = 0.0f;
+        }
         audio_data.music_beat_active = (current_ms < dsp_music_active_until_ms);
+        audio_data.is_music_active = audio_data.music_beat_active;
+        audio_data.music_beat_interval_ms = (dsp_beat_interval_ms > 150U) ? dsp_beat_interval_ms : 500U;
         if (audio_data.music_beat_active && dsp_beat_interval_ms > 150U) {
             audio_data.music_beat_phase = static_cast<float>(current_ms % dsp_beat_interval_ms) /
                                           static_cast<float>(dsp_beat_interval_ms);
@@ -2273,6 +2300,8 @@ void HalSensors::readPcSimulatedAudio() {
     bool local_double_clap = false;
     bool local_whistle = false;
     bool local_typing = false;
+    uint8_t local_typing_clicks = 0;
+    uint32_t local_typing_win_start = 0;
     bool local_music_beat = false;
     uint32_t local_beat_interval = 500U;
     bool local_wake_latched = false;
@@ -2285,6 +2314,8 @@ void HalSensors::readPcSimulatedAudio() {
         local_noise_floor = dsp_noise_floor_db;
         local_zcr = dsp_latest_zcr;
         local_typing = (current_ms < dsp_typing_active_until_ms);
+        local_typing_clicks = dsp_typing_click_count;
+        local_typing_win_start = dsp_typing_window_start_ms;
         local_music_beat = (current_ms < dsp_music_active_until_ms);
         local_beat_interval = dsp_beat_interval_ms;
         local_wake_latched = dsp_wake_word_latched;
@@ -2303,7 +2334,18 @@ void HalSensors::readPcSimulatedAudio() {
     audio_data.adaptive_noise_floor_db = local_noise_floor;
     audio_data.spectral_zcr = local_zcr;
     audio_data.is_typing_cadence = local_typing;
+    audio_data.is_typing_active = local_typing;
+    if (local_typing) {
+        float elapsed_sec = static_cast<float>(current_ms - local_typing_win_start) * 0.001f;
+        if (elapsed_sec < 0.35f) elapsed_sec = 0.35f;
+        float rate = static_cast<float>(local_typing_clicks) / elapsed_sec;
+        audio_data.typing_click_rate = fminf(18.0f, fmaxf(2.0f, rate));
+    } else {
+        audio_data.typing_click_rate = 0.0f;
+    }
     audio_data.music_beat_active = local_music_beat;
+    audio_data.is_music_active = local_music_beat;
+    audio_data.music_beat_interval_ms = (local_beat_interval > 150U) ? local_beat_interval : 500U;
     if (local_music_beat && local_beat_interval > 150U) {
         audio_data.music_beat_phase = static_cast<float>(current_ms % local_beat_interval) /
                                       static_cast<float>(local_beat_interval);

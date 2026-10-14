@@ -382,6 +382,10 @@ std::string OracleBrain::buildTelemetryJsonString(const OracleContextPacket& con
         trigger_focus = "BOCEJO / FADIGA VISUAL: O humano acabou de bocejar na câmera! Sugira café expresso, água gelada ou um cochilo tático antes que ele durma no teclado.";
     } else if (context_packet.trigger_reason == "NIGHT_OWL_DARK") {
         trigger_focus = "MODO CORUJÃO (QUARTO ESCURO): A iluminação caiu (< 25 lux)! Comente sobre programar nas sombras como um hacker de filme ou sugira ligar uma luz indireta.";
+    } else if (context_packet.trigger_reason == "GIT_COMMIT_DONE") {
+        trigger_focus = "GIT COMMIT REALIZADO: O contador de arquivos modificados no Git caiu para zero! Comemore com humor geek/sarcástico o código recém-commitado (+50 XP ganhos) e torça para não quebrar a produção.";
+    } else if (context_packet.trigger_reason == "END_OF_SHIFT_DEBRIEF") {
+        trigger_focus = "ENCERRAMENTO DE EXPEDIENTE (DEBRIEFING DIÁRIO): Fim de tarde na bancada! Faça um balanço carismático e bem-humorado da missão diária do humano (minutos de foco, nível RPG, posturas e cafés) encerrando o turno.";
     }
 
     telemetry_json += ",\"creative_lens_directive\":\"" +
@@ -835,6 +839,38 @@ OracleBrainResponse OracleBrain::getFallbackOfflineResponse(const OracleContextP
         fallback.energy_delta = -2;
         fallback.new_memory = "Mudança brusca de clima detectada no Open-Meteo";
         fallback.memory_tags = "clima,chuva,temperatura";
+        return fallback;
+    }
+
+    if (context_packet.trigger_reason == "GIT_COMMIT_DONE") {
+        static const char* const COMMIT_TEMPLATES[] = {
+            "Git limpo e commit empacotado! +50 XP na conta. Só espero que não seja 'fix: agora vai'!",
+            "Working tree limpinha! +50 XP pelo commit, parceiro. Rezei pros testes passarem no CI!",
+            "Commit registrado com sucesso! +50 XP! Se quebrar em produção a culpa não é do seu co-piloto."
+        };
+        const char* tpl = COMMIT_TEMPLATES[fallback_cursor % 3];
+        fallback_cursor = static_cast<uint8_t>((fallback_cursor + 1U) % OFFLINE_BANK_COUNT);
+        fallback.reply_text = truncateUtf8Reply(tpl, MAX_REPLY_CHARS);
+        fallback.target_emotion = EMOTION_HAPPY;
+        fallback.mood_delta = +10;
+        fallback.energy_delta = +4;
+        fallback.new_memory = "Realizou git commit limpando os arquivos pendentes do repositório";
+        fallback.memory_tags = "git,commit,codigo,xp";
+        return fallback;
+    }
+
+    if (context_packet.trigger_reason == "END_OF_SHIFT_DEBRIEF") {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "Missão cumprida! %u min de foco hoje no Nível %u. Salva tudo, fecha a IDE e vai descansar!",
+                      static_cast<unsigned int>(context_packet.focus_minutes),
+                      static_cast<unsigned int>(habit_matrix.cyber_level));
+        fallback.reply_text = truncateUtf8Reply(buf, MAX_REPLY_CHARS);
+        fallback.target_emotion = EMOTION_HAPPY;
+        fallback.mood_delta = +12;
+        fallback.energy_delta = +5;
+        fallback.new_memory = "Concluiu o Ritual de Encerramento de Expediente (Debriefing Diário)";
+        fallback.memory_tags = "expediente,debriefing,foco,missao";
         return fallback;
     }
 

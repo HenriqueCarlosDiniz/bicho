@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #if defined(ARDUINO)
 #include <SD.h>
 #else
@@ -183,7 +184,22 @@ PetController::PetController()
       vu_peak_left(2),
       vu_peak_right(2),
       last_vu_decay_ms(0),
-      hud_popups()
+      hud_popups(),
+      micro_saccade_offset_x(0.0f),
+      micro_saccade_offset_y(0.0f),
+      micro_saccade_until_ms(0),
+      next_micro_saccade_ms(2800),
+      pupil_lux_radius_offset(0.0f),
+      side_monitor_since_ms(0),
+      is_side_eye_active(false),
+      side_eye_dir(0.0f),
+      bounce_offset_y(0.0f),
+      slouch_drop_y(0.0f),
+      was_slouching_pose(false),
+      prev_git_modified_files(0),
+      git_commits_today(0),
+      shift_debrief_done_today(false),
+      debrief_overlay_until_ms(0)
 {
     internal_stats = {20, 86, 88, 0, 0, 0};
     current_pose = {
@@ -626,12 +642,67 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     }
 
     // 2.2. Monitor de Postura Calibrada ("Modo Camarão" ou rosto colado no monitor em relação ao baseline do usuário)
+    bool currently_slouching = (gaze_data.face_detected && gaze_data.is_slouching);
+    if (was_slouching_pose && !currently_slouching) {
+        // Assim que is_slouching voltar para false, toca um efeito sonoro curto de alívio
+        playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
+        spawnHudPopup("POSTURA OK!", 122.0f, 44.0f, COLOR_CYBER_GREEN, 1600U);
+    }
+    was_slouching_pose = currently_slouching;
+
     if (gaze_data.face_detected && (gaze_data.is_slouching || gaze_data.is_too_close)) {
         if (bad_posture_since_ms == 0) {
             bad_posture_since_ms = now_ms;
         }
     } else {
         bad_posture_since_ms = 0;
+    }
+
+    // 2.25. Recompensa Instantânea de Git Commit (transição de prev_git_modified_files > 0 para 0)
+    if (prev_git_modified_files > 0U && env_data.git_modified_files == 0U) {
+        git_commits_today++;
+        oracle_brain.addXpPoints(50);
+        internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 10, 0, MAX_STAT_VALUE);
+        current_emotion = EMOTION_HAPPY;
+        emotion_lock_until_ms = now_ms + 5000U;
+        blink_bounce_until_ms = now_ms + 300U;
+        spawnHudPopup("COMMIT! +50 XP", 116.0f, 44.0f, COLOR_CYBER_GREEN, 2400U);
+        playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_pomodoro_fanfare.wav").c_str());
+        syncPersistentState(hal_sensors);
+        if (!oracle_brain.isWaitingAi()) {
+            triggerSarcasticOracle(hal_sensors, "GIT_COMMIT_DONE");
+        }
+        M5_LOGI("[GIT-COMMIT] Transicao git_modified_files %u -> 0 detectada! +50 XP, +10 Humor e gatilho GIT_COMMIT_DONE.",
+                static_cast<unsigned int>(prev_git_modified_files));
+    }
+    prev_git_modified_files = env_data.git_modified_files;
+
+    // 2.28. Consulta relógio local para o Ritual de Encerramento de Expediente (18:30 automático ou Palma após 17:30)
+    std::time_t now_epoch = std::time(nullptr);
+    const std::tm* local_tm = std::localtime(&now_epoch);
+    bool is_after_1730 = false;
+    if (local_tm != nullptr) {
+        if (local_tm->tm_hour < 12 && shift_debrief_done_today) {
+            shift_debrief_done_today = false;
+            git_commits_today = 0;
+        }
+        is_after_1730 = (local_tm->tm_hour > 17) || (local_tm->tm_hour == 17 && local_tm->tm_min >= 30);
+        if (!shift_debrief_done_today &&
+            local_tm->tm_hour == 18 &&
+            local_tm->tm_min == 30 &&
+            gaze_data.face_detected &&
+            internal_stats.focus_minutes >= 15) {
+            shift_debrief_done_today = true;
+            debrief_overlay_until_ms = now_ms + 8000U;
+            current_emotion = EMOTION_HAPPY;
+            emotion_lock_until_ms = now_ms + 8000U;
+            spawnHudPopup("FIM DE TURNO!", 116.0f, 44.0f, COLOR_CYBER_GREEN, 2400U);
+            playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_pomodoro_fanfare.wav").c_str());
+            if (!oracle_brain.isWaitingAi()) {
+                triggerSarcasticOracle(hal_sensors, "END_OF_SHIFT_DEBRIEF");
+            }
+            M5_LOGI("[DEBRIEFING] Ritual automatico de encerramento de expediente (18:30) acionado!");
+        }
     }
 
     // 2.3. Monitor de Celular / Doomscrolling (olhando para baixo para o smartphone na mesa)
@@ -722,7 +793,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.addXpPoints(4);
             spawnHudPopup("SIM! +4 XP", 128.0f, 44.0f, COLOR_CYBER_GREEN, 1700U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-            if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi() && !is_muted_indefinitely) {
+            if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
                 static const char* const NOD_PHRASES[] = {
                     "Afirmativo! Detectei seu aceno positivo na câmera!",
                     "Confirmado no visual! Estamos na mesma sintonia, parceiro!",
@@ -737,7 +808,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.addXpPoints(3);
             spawnHudPopup("NEGATIVO! +3 XP", 116.0f, 44.0f, COLOR_CYBER_ORANGE, 1700U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-            if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi() && !is_muted_indefinitely) {
+            if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
                 static const char* const SHAKE_PHRASES[] = {
                     "Entendido! Vi você balançando a cabeça dizendo não para a lente.",
                     "Negativo visual registrado! Abortando essa hipótese na hora.",
@@ -755,8 +826,8 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             current_emotion = EMOTION_LISTENING;
             emotion_lock_until_ms = now_ms + 4500U;
             spawnHudPopup("MODO SILENCIO", 120.0f, 44.0f, COLOR_CYBER_ORANGE, 1800U);
-            stopSpeakingImmediately(hal_sensors, "[SILÊNCIO INDEFINIDO ATIVO — PRESSIONE [Q], [J] OU 2 PALMAS P/ SAIR]");
-            M5_LOGI("[SILENCIO] Modo Silencio Indefinido ATIVADO via tecla [Q]!");
+            stopSpeakingImmediately(hal_sensors, "[MODO SILÊNCIO ATIVO — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU 2 PALMAS P/ SOM)]");
+            M5_LOGI("[SILENCIO] Modo Silencio Indefinido ATIVADO via tecla [Q]! Interacao por texto mantida.");
         } else {
             current_emotion = EMOTION_HAPPY;
             emotion_lock_until_ms = now_ms + 3500U;
@@ -765,7 +836,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             static const char* const UNMUTE_PHRASES[] = {
                 "Modo silêncio encerrado! Voz tática do Bicho reativada na bancada.",
                 "Cordas vocais cibernéticas online de novo! O que manda, chefe?",
-                "Silêncio desativado! Estou de volta na frequência da bancada."
+                "Silêncio desativado! Estou de volta na frequência sonora da bancada."
             };
             speakWithLipSync(hal_sensors, UNMUTE_PHRASES[(local_phrase_cursor++) % 3U]);
             M5_LOGI("[SILENCIO] Modo Silencio Indefinido ENCERRADO via tecla [Q]!");
@@ -799,17 +870,31 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         }
         M5_LOGI("[GESTO] Joinha ([J]) acionado! +8 Humor, +10 XP e voz ativa.");
     }
-    // (2) ✋ Palma Aberta ("Stop / Silêncio" / [H]): Corta a fala IMEDIATAMENTE e ativa Modo Silêncio Indefinido!
+    // (2) ✋ Palma Aberta ("Stop / Silêncio" ou Debriefing de Fim de Tarde após 17:30):
     else if (gaze_data.gesture_open_palm && !gaze_data.gesture_thumbs_up &&
              (lip_sync_state.is_speaking || !is_muted_indefinitely || (now_ms - last_hand_gesture_react_ms > 5500U))) {
         last_hand_gesture_react_ms = now_ms;
-        is_muted_indefinitely = true; // Permanece em silêncio indefinidamente até tecla [Q], [J] ou 2 Palmas 👏👏!
-        pip_display_until_ms = now_ms + 5000U;
-        current_emotion = EMOTION_LISTENING;
-        emotion_lock_until_ms = now_ms + 4500U;
-        spawnHudPopup("PALMA: SILENCIO", 114.0f, 44.0f, COLOR_CYBER_ORANGE, 1900U);
-        stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA (STOP) — SILÊNCIO INDEFINIDO ATIVO ([Q] OU 2 PALMAS P/ SAIR)]");
-        M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP/SILENCIO) detectada! Modo Silencio Indefinido ativado.");
+        if (is_after_1730 && !lip_sync_state.is_speaking && (now_ms >= debrief_overlay_until_ms)) {
+            shift_debrief_done_today = true;
+            debrief_overlay_until_ms = now_ms + 8000U;
+            pip_display_until_ms = now_ms + 5000U;
+            current_emotion = EMOTION_HAPPY;
+            emotion_lock_until_ms = now_ms + 8000U;
+            spawnHudPopup("FIM DE TURNO!", 116.0f, 44.0f, COLOR_CYBER_GREEN, 2400U);
+            playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_pomodoro_fanfare.wav").c_str());
+            if (!oracle_brain.isWaitingAi()) {
+                triggerSarcasticOracle(hal_sensors, "END_OF_SHIFT_DEBRIEF");
+            }
+            M5_LOGI("[DEBRIEFING] Ritual manual de encerramento de expediente acionado por Palma Aberta apos 17:30!");
+        } else {
+            is_muted_indefinitely = true; // Permanece em silêncio de áudio até tecla [Q], [J] ou 2 Palmas 👏👏!
+            pip_display_until_ms = now_ms + 5000U;
+            current_emotion = EMOTION_LISTENING;
+            emotion_lock_until_ms = now_ms + 4500U;
+            spawnHudPopup("PALMA: SILENCIO", 114.0f, 44.0f, COLOR_CYBER_ORANGE, 1900U);
+            stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU 2 PALMAS P/ SOM)]");
+            M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP/SILENCIO) detectada! Modo Silencio Indefinido ativado.");
+        }
     }
     // Atalhos de teclado dedicados ([K] Selfie Vitória):
     else if (gaze_data.gesture_victory && (now_ms - last_hand_gesture_react_ms > 5000U)) {
@@ -874,7 +959,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         oracle_brain.addXpPoints(6);
         spawnHudPopup("ASSOBIO! +6 XP", 116.0f, 44.0f, COLOR_CYBER_GREEN, 1900U);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-        if (!is_muted_indefinitely && !lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
+        if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
             static const char* const WHISTLE_PHRASES[] = {
                 "Ouvi seu assobio sintonizado no microfone! Chamou o copiloto da bancada?",
                 "Frequência de assobio detectada! Estou atento por aqui, chefe!",
@@ -890,10 +975,10 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     }
 
     // 3. Camada 2: Gatilho do Cérebro Multimodal (Toque, Voz, Objeto na Lente, Intruso, Bocejo, Postura, Celular, Briefing)
+    // Mesmo em Modo Silêncio (is_muted_indefinitely), o Bicho continua interagindo e falando por texto na tela!
     if (!oracle_brain.isWaitingAi() && (now_ms - last_oracle_trigger_ms > ORACLE_COOLDOWN_MS)) {
         std::string world_trigger;
         const ExternalWorldContext& world_ctx = world_context_service.getWorldContext();
-        bool is_muted_now = is_muted_indefinitely;
 
         if (touch_poke_face || audio_data.interaction_triggered) {
             is_muted_indefinitely = false; // Toque manual explícito encerra o modo silêncio
@@ -901,8 +986,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.saveEventSnapshotToSd("TOUCH_POKE");
             triggerSarcasticOracle(hal_sensors, "TOUCH_POKE");
         } else if (audio_data.object_scan_triggered ||
-                   (!is_muted_now &&
-                    object_close_since_ms > 0 &&
+                   (object_close_since_ms > 0 &&
                     (now_ms - object_close_since_ms >= 1400U) &&
                     (now_ms - last_object_inspect_ms >= 45000U))) {
             if (audio_data.object_scan_triggered) {
@@ -914,15 +998,14 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_camera_scan.wav").c_str());
             oracle_brain.saveEventSnapshotToSd("OBJECT_INSPECTION");
             triggerSarcasticOracle(hal_sensors, "OBJECT_INSPECTION");
-        } else if (!is_muted_now && audio_data.vad_phrase_completed) {
+        } else if (audio_data.vad_phrase_completed) {
             oracle_brain.recordHabitVoiceInteraction();
             oracle_brain.saveEventSnapshotToSd("VOICE_HANDS_FREE");
             triggerSarcasticOracle(hal_sensors, "VOICE_HANDS_FREE");
-        } else if (!is_muted_now && audio_data.is_loud_peak && audio_data.noise_level_db > 85.0f) {
+        } else if (audio_data.is_loud_peak && audio_data.noise_level_db > 85.0f) {
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_glitch_shock.wav").c_str());
             triggerSarcasticOracle(hal_sensors, "HIGH_NOISE");
-        } else if (!is_muted_now &&
-                   intruder_since_ms > 0 &&
+        } else if (intruder_since_ms > 0 &&
                    (now_ms - intruder_since_ms >= 1800U) &&
                    (now_ms - last_intruder_alert_ms >= 90000U)) {
             last_intruder_alert_ms = now_ms;
@@ -931,8 +1014,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_camera_scan.wav").c_str());
             oracle_brain.saveEventSnapshotToSd("INTRUDER_DETECTED");
             triggerSarcasticOracle(hal_sensors, "INTRUDER_DETECTED");
-        } else if (!is_muted_now &&
-                   yawn_since_ms > 0 &&
+        } else if (yawn_since_ms > 0 &&
                    (now_ms - yawn_since_ms >= 1200U) &&
                    (now_ms - last_yawn_alert_ms >= 90000U)) {
             last_yawn_alert_ms = now_ms;
@@ -940,8 +1022,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.saveEventSnapshotToSd("YAWN_FATIGUE");
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             triggerSarcasticOracle(hal_sensors, "YAWN_FATIGUE");
-        } else if (!is_muted_now &&
-                   !daily_briefing_done &&
+        } else if (!daily_briefing_done &&
                    hal_sensors.getSdConfig().morning_briefing_enabled &&
                    world_ctx.has_valid_sync &&
                    now_ms > 9000U &&
@@ -949,8 +1030,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             daily_briefing_done = true;
             M5_LOGI("[BRIEFING] Disparando Briefing Tatico da Sessao com clima, dolar e status de repositorio!");
             triggerSarcasticOracle(hal_sensors, "DAILY_BRIEFING");
-        } else if (!is_muted_now &&
-                   bad_posture_since_ms > 0 &&
+        } else if (bad_posture_since_ms > 0 &&
                    (now_ms - bad_posture_since_ms >= 5000U) &&
                    (now_ms - last_posture_alert_ms >= 90000U)) {
             last_posture_alert_ms = now_ms;
@@ -959,8 +1039,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.saveEventSnapshotToSd("BAD_POSTURE");
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_posture_alert.wav").c_str());
             triggerSarcasticOracle(hal_sensors, "BAD_POSTURE");
-        } else if (!is_muted_now &&
-                   phone_look_down_since_ms > 0 &&
+        } else if (phone_look_down_since_ms > 0 &&
                    (now_ms - phone_look_down_since_ms >= 4500U) &&
                    (now_ms - last_phone_alert_ms >= 90000U)) {
             last_phone_alert_ms = now_ms;
@@ -968,8 +1047,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.saveEventSnapshotToSd("PHONE_DOOMSCROLL");
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_posture_alert.wav").c_str());
             triggerSarcasticOracle(hal_sensors, "PHONE_DOOMSCROLL");
-        } else if (!is_muted_now &&
-                   procrastination_since_ms > 0 &&
+        } else if (procrastination_since_ms > 0 &&
                    (now_ms - procrastination_since_ms >= 8000U) &&
                    (now_ms - last_procrastination_alert_ms >= 120000U)) {
             last_procrastination_alert_ms = now_ms;
@@ -977,25 +1055,22 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.saveEventSnapshotToSd("PROCRASTINATION");
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_posture_alert.wav").c_str());
             triggerSarcasticOracle(hal_sensors, "PROCRASTINATION_DETECTED");
-        } else if (!is_muted_now &&
-                   dark_room_since_ms > 0 &&
+        } else if (dark_room_since_ms > 0 &&
                    (now_ms - dark_room_since_ms >= 15000U) &&
                    (now_ms - last_night_owl_alert_ms >= 240000U)) {
             last_night_owl_alert_ms = now_ms;
             dark_room_since_ms = 0;
             oracle_brain.saveEventSnapshotToSd("NIGHT_OWL_DARK");
             triggerSarcasticOracle(hal_sensors, "NIGHT_OWL_DARK");
-        } else if (!is_muted_now &&
-                   internal_stats.focus_minutes > 0 &&
+        } else if (internal_stats.focus_minutes > 0 &&
                    (internal_stats.focus_minutes % FOCUS_LIMIT_MINUTES == 0) &&
                    prev_focus != internal_stats.focus_minutes) {
             triggerSarcasticOracle(hal_sensors, "OVERWORK");
-        } else if (!is_muted_now &&
-                   internal_stats.meeting_minutes >= MEETING_FATIGUE_MINUTES &&
+        } else if (internal_stats.meeting_minutes >= MEETING_FATIGUE_MINUTES &&
                    audio_data.is_continuous_speech &&
                    (now_ms - last_oracle_trigger_ms > 25000U)) {
             triggerSarcasticOracle(hal_sensors, "LONG_MEETING");
-        } else if (!is_muted_now && world_context_service.checkWorldTriggers(now_ms, world_trigger)) {
+        } else if (world_context_service.checkWorldTriggers(now_ms, world_trigger)) {
             triggerSarcasticOracle(hal_sensors, world_trigger.c_str());
         }
     }
@@ -1339,11 +1414,8 @@ void PetController::applyOracleResponse(HalSensors& hal_sensors, const OracleRes
     // Salva evolução e humor do bicho após cada interação com o Oráculo
     syncPersistentState(hal_sensors);
 
-    if (is_muted_indefinitely) {
-        stopSpeakingImmediately(hal_sensors, response_payload.reply_text);
-    } else {
-        speakWithLipSync(hal_sensors, response_payload.reply_text);
-    }
+    // Mesmo em Modo Silêncio (is_muted_indefinitely), speakWithLipSync anima legenda e boca sem emitir som!
+    speakWithLipSync(hal_sensors, response_payload.reply_text);
 }
 
 static void writeWavFileToSdHelper(const char* file_path, const std::vector<int16_t>& samples, uint32_t sample_rate_hz) {
@@ -1948,7 +2020,7 @@ uint16_t PetController::getActiveOpticCoreColor() const {
 }
 
 bool PetController::playSdSoundEffect(HalSensors& hal_sensors, const char* relative_sd_path) {
-    if (relative_sd_path == nullptr || !oracle_brain.isSdStorageReady()) {
+    if (is_muted_indefinitely || relative_sd_path == nullptr || !oracle_brain.isSdStorageReady()) {
         return false;
     }
 
@@ -2390,8 +2462,10 @@ void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_
     // Interrompe qualquer reprodução anterior antes de realocar wav_buffer (evita use-after-free na thread de áudio)
     M5.Speaker.stop();
 
-    // Alterna barramento I2S para o alto-falante (AW88298 no CoreS3) durante a fala
-    hal_sensors.switchAudioBusMode(AUDIO_MODE_SPEAKER);
+    // Alterna barramento I2S para o alto-falante apenas se não estiver em Modo Silêncio
+    if (!is_muted_indefinitely) {
+        hal_sensors.switchAudioBusMode(AUDIO_MODE_SPEAKER);
+    }
 
     std::strncpy(lip_sync_state.full_text, reply_text, DIALOGUE_MAX_LEN - 1);
     lip_sync_state.full_text[DIALOGUE_MAX_LEN - 1] = '\0';
@@ -2403,22 +2477,22 @@ void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_
     // Registra a fala no log persistente (sd_card/memory/speech_log.jsonl) e no histórico anti-repetição
     oracle_brain.recordSpokenPhraseToSd(lip_sync_state.full_text, "LOCAL", "LOCAL_REACTION");
 
-    // 1. Tenta gerar e carregar voz neural em Português (WAV PCM 16-bit 16kHz Mono) no ambiente native_pc
-    using_wav_voice = generateAndLoadVoiceWav(lip_sync_state.full_text);
+    // 1. Tenta gerar e carregar voz neural em Português (WAV PCM 16-bit 16kHz Mono) apenas quando o som estiver ativo
+    using_wav_voice = (!is_muted_indefinitely) ? generateAndLoadVoiceWav(lip_sync_state.full_text) : false;
     uint32_t start_ms = M5.millis();
     playback_start_ms = start_ms;
     lip_sync_state.next_char_timestamp_ms = start_ms;
     lip_sync_state.subtitle_expire_ms = 0;
 
-    if (using_wav_voice && !wav_buffer.empty()) {
+    if (!is_muted_indefinitely && using_wav_voice && !wav_buffer.empty()) {
         // 2. Reproduz o buffer WAV de forma assíncrona no canal 0 sem bloquear o loop de 60 FPS
         M5.Speaker.playWav(wav_buffer.data(), wav_buffer.size());
     }
 }
 
 void PetController::playProceduralCharTone(char current_char) {
-    // Ignora espaços na emissão sonora
-    if (current_char == ' ') {
+    // Ignora espaços ou Modo Silêncio na emissão sonora
+    if (current_char == ' ' || is_muted_indefinitely) {
         return;
     }
 
@@ -2522,12 +2596,14 @@ void PetController::updateLipSyncStep(HalSensors& hal_sensors, uint32_t now_ms) 
         using_wav_voice = false;
         lip_sync_state.subtitle_expire_ms = now_ms + 4500;
         target_pose.mouth_open_height = MOUTH_CLOSED_HEIGHT;
-        hal_sensors.switchAudioBusMode(AUDIO_MODE_MIC);
+        if (!is_muted_indefinitely) {
+            hal_sensors.switchAudioBusMode(AUDIO_MODE_MIC);
+        }
     }
 }
 
 void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint32_t now_ms) {
-    // 1. Micro-Saccades Oculares Naturais: pequenos saltos rápidos de fixação para dar vida biológica ao olhar
+    // 1. Micro-Saccades Oculares Naturais + Sacadas Rápidas de Foco (micro_saccade_offset_x / micro_saccade_offset_y)
     if (now_ms >= next_saccade_ms) {
         next_saccade_ms = now_ms + 900U + ((now_ms * 37U) % 1800U);
         if (current_emotion == EMOTION_SLEEPING || current_emotion == EMOTION_SLEEPY) {
@@ -2541,16 +2617,69 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
         }
     }
 
+    // 1.1. Sacadas Oculares de "Vida" em Foco (a cada 2500..4500 ms, deslocamento rápido de -2 a +2 px por 180 ms)
+    if (gaze_data.face_detected && (current_emotion == EMOTION_FOCUSED || current_emotion == EMOTION_IDLE)) {
+        if (now_ms >= next_micro_saccade_ms) {
+            next_micro_saccade_ms = now_ms + 2500U + ((now_ms * 43U) % 2001U);
+            micro_saccade_until_ms = now_ms + 180U;
+            int32_t ms_x = static_cast<int32_t>((now_ms * 23U) % 5U) - 2; // -2 a +2 px
+            int32_t ms_y = static_cast<int32_t>((now_ms * 31U) % 5U) - 2; // -2 a +2 px
+            if (ms_x == 0 && ms_y == 0) {
+                ms_x = ((now_ms & 1U) != 0U) ? 2 : -2;
+            }
+            micro_saccade_offset_x = static_cast<float>(ms_x);
+            micro_saccade_offset_y = static_cast<float>(ms_y);
+        }
+    }
+    if (now_ms >= micro_saccade_until_ms) {
+        micro_saccade_offset_x = 0.0f;
+        micro_saccade_offset_y = 0.0f;
+    }
+
+    // 1.2. Dilatação Pupilar Reativa à Luz Ambiente (env_data.ambient_lux suavizado por interpolação linear)
+    float target_lux_offset = 0.0f;
+    if (cached_env_data.ambient_lux > 0U && cached_env_data.ambient_lux < 80U) {
+        target_lux_offset = 3.0f;  // Ambiente escuro (< 80 lux): dilata a pupila (+3 px no raio)
+    } else if (cached_env_data.ambient_lux > 650U) {
+        target_lux_offset = -2.0f; // Ambiente muito iluminado (> 650 lux): contrai a pupila (-2 px no raio)
+    }
+    pupil_lux_radius_offset += (target_lux_offset - pupil_lux_radius_offset) * 0.08f;
+
+    // 1.3. Olhar de Soslaio (Side-Eye) para o Monitor Lateral (> 5000 ms contínuos olhando para o lado)
+    bool looking_side_monitor = gaze_data.face_detected &&
+                                (std::fabs(gaze_data.head_yaw_deg) > 18.0f || std::fabs(gaze_data.target_x) > 0.45f);
+    if (looking_side_monitor) {
+        if (side_monitor_since_ms == 0U) {
+            side_monitor_since_ms = now_ms;
+        }
+        if (now_ms - side_monitor_since_ms > 5000U) {
+            is_side_eye_active = true;
+            if (std::fabs(gaze_data.target_x) > 0.15f) {
+                side_eye_dir = (gaze_data.target_x > 0.0f) ? 1.0f : -1.0f;
+            } else {
+                side_eye_dir = (gaze_data.head_yaw_deg > 0.0f) ? 1.0f : -1.0f;
+            }
+        }
+    } else {
+        side_monitor_since_ms = 0U;
+        is_side_eye_active = false;
+    }
+
     // Alvo do rastreamento ocular normalizado [-1.0, 1.0] + micro-saccades e inclinação da cabeça (head roll)
-    target_pose.current_eye_x = (gaze_data.target_x * FACE_GAZE_MAX_X) + saccade_offset_x;
-    target_pose.current_eye_y = (gaze_data.target_y * FACE_GAZE_MAX_Y) + saccade_offset_y;
+    target_pose.current_eye_x = (gaze_data.target_x * FACE_GAZE_MAX_X) + saccade_offset_x + micro_saccade_offset_x;
+    target_pose.current_eye_y = (gaze_data.target_y * FACE_GAZE_MAX_Y) + saccade_offset_y + micro_saccade_offset_y;
 
     // Reatividade em tempo real à digitação: olhos varrem horizontalmente como se estivessem lendo o código!
-    if (cached_audio_data.is_typing_cadence && current_emotion != EMOTION_SLEEPING && current_emotion != EMOTION_STARTLED) {
+    if ((cached_audio_data.is_typing_active || cached_audio_data.is_typing_cadence) &&
+        current_emotion != EMOTION_SLEEPING && current_emotion != EMOTION_STARTLED) {
         float scan_phase = std::fmod(static_cast<float>(now_ms) * 0.0032f, 1.0f);
         float read_sweep_x = (scan_phase * 2.0f - 1.0f) * 10.5f; // Varre da esquerda para a direita e salta de volta (carriage return)
-        target_pose.current_eye_x = (target_pose.current_eye_x * 0.35f) + read_sweep_x;
-        target_pose.current_eye_y = (target_pose.current_eye_y * 0.45f) + 3.5f;
+        target_pose.current_eye_x = (target_pose.current_eye_x * 0.35f) + read_sweep_x + micro_saccade_offset_x;
+        target_pose.current_eye_y = (target_pose.current_eye_y * 0.45f) + 3.5f + micro_saccade_offset_y;
+    }
+
+    if (is_side_eye_active && current_emotion != EMOTION_SLEEPING && current_emotion != EMOTION_STARTLED) {
+        target_pose.current_eye_x = side_eye_dir * FACE_GAZE_MAX_X;
     }
 
     target_pose.eye_offset_x = target_pose.current_eye_x;
@@ -2586,7 +2715,7 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
         next_wink_ms = now_ms + 9500U + ((now_ms * 29U) % 8500U);
     }
 
-    // 3. Configuração padrão da pose + Dilatação Reativa da Pupila (dilata ao falar/ouvir/sorrir, contrai em foco profundo)
+    // 3. Configuração padrão da pose + Dilatação Reativa da Pupila (fala/sorriso/foco + luz ambiente)
     float pupil_react = 0.0f;
     if (lip_sync_state.is_speaking || current_emotion == EMOTION_LISTENING || gaze_data.is_smiling || (now_ms < head_pat_until_ms)) {
         pupil_react = 1.8f;
@@ -2597,7 +2726,7 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
     target_pose.eye_radius_current = FACE_EYE_DEFAULT_R;
     target_pose.eye_scale_x = 1.0f;
     target_pose.eye_scale_y = 1.0f;
-    target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R + pupil_react;
+    target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R + pupil_react + pupil_lux_radius_offset;
     target_pose.upper_eyelid_closure = 0.0f;  // Olhos totalmente abertos por padrão
     target_pose.lower_eyelid_closure = 0.16f; // Curvatura inferior sorridente e simpática
     target_pose.eyebrow_angle_deg = -5.0f;    // Sobrancelhas levemente erguidas no centro (/ \), expressão amigável
@@ -2614,7 +2743,7 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
             target_pose.eye_radius_current = FACE_EYE_DEFAULT_R + 3.0f;
             target_pose.eye_scale_x = 0.90f;
             target_pose.eye_scale_y = 1.18f;
-            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 2.5f; // Pupila contrai em choque!
+            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 2.5f + pupil_lux_radius_offset; // Pupila contrai em choque!
             target_pose.upper_eyelid_closure = 0.0f;
             target_pose.lower_eyelid_closure = 0.0f;
             target_pose.eyebrow_offset_y = -6.5f;
@@ -2643,7 +2772,7 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
             target_pose.eye_scale_y = 0.90f;
             target_pose.upper_eyelid_closure = 0.32f;
             target_pose.lower_eyelid_closure = 0.08f;
-            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.5f;
+            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.5f + pupil_lux_radius_offset;
             target_pose.eyebrow_angle_deg = 15.0f;
             target_pose.eyebrow_offset_y = 3.0f;
             target_pose.mouth_width_current = 18.0f;
@@ -2721,7 +2850,7 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
             target_pose.eye_radius_current = FACE_EYE_DEFAULT_R + 2.0f;
             target_pose.eye_scale_x = 1.0f + std::sin(static_cast<float>(now_ms) * 0.018f) * 0.12f;
             target_pose.eye_scale_y = 1.0f + std::cos(static_cast<float>(now_ms) * 0.018f) * 0.12f;
-            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.5f;
+            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.5f + pupil_lux_radius_offset;
             target_pose.upper_eyelid_closure = 0.15f;
             target_pose.eyebrow_angle_deg = -14.0f;
             target_pose.eyebrow_offset_y = -2.0f;
@@ -2755,16 +2884,33 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
         target_pose.head_tilt_deg = std::sin(static_cast<float>(now_ms) * 0.012f) * 8.5f;
     }
 
-    // Ouvido 2.0: Se detectar batida rítmica/música no ambiente (PC ou CoreS3), o Bicho dança e pulsa as lentes no BPM!
-    if (cached_audio_data.music_beat_active && !lip_sync_state.is_speaking && current_emotion != EMOTION_SLEEPY) {
-        float beat_wave = std::sin(cached_audio_data.music_beat_phase * 6.2831853f);
-        float beat_pulse = std::fabs(beat_wave);
-        target_pose.eyebrow_offset_y += beat_wave * 3.0f;
-        target_pose.head_tilt_deg += beat_wave * 4.8f;
-        target_pose.eye_scale_x += beat_pulse * 0.08f;
-        target_pose.eye_scale_y += beat_pulse * 0.08f;
-        target_pose.mouth_curve_factor = std::fmax(target_pose.mouth_curve_factor, 0.82f);
-        target_pose.cheek_glow_intensity = std::fmax(target_pose.cheek_glow_intensity, 0.55f);
+    // Olhar de Soslaio (Side-Eye): estreita levemente as pálpebras (+4 px de fechamento superior/inferior)
+    if (is_side_eye_active && current_emotion != EMOTION_SLEEPING && current_emotion != EMOTION_STARTLED) {
+        constexpr float side_eye_lid_delta = 4.0f / FACE_EYE_RY_DEFAULT; // +4 px de fechamento
+        target_pose.upper_eyelid_closure = std::fmin(0.75f, target_pose.upper_eyelid_closure + side_eye_lid_delta);
+        target_pose.lower_eyelid_closure = std::fmin(0.75f, target_pose.lower_eyelid_closure + side_eye_lid_delta);
+    }
+
+    // Efeito "Espelho Físico" de Postura (gaze_data.is_slouching): achata levemente a altura vertical dos olhos (-15%)
+    if (gaze_data.face_detected && gaze_data.is_slouching) {
+        target_pose.eye_scale_y *= 0.85f;
+    }
+
+    // Modo DJ Silencioso (Sincronia com BPM Real): bounce_offset_y = sin(now_ms * TWO_PI / music_beat_interval_ms) * 3.0f
+    if (cached_audio_data.is_music_active && cached_audio_data.music_beat_interval_ms > 0U && current_emotion != EMOTION_SLEEPY) {
+        constexpr float two_pi = 6.2831853f;
+        bounce_offset_y = std::sin(static_cast<float>(now_ms) * two_pi / static_cast<float>(cached_audio_data.music_beat_interval_ms)) * 3.0f;
+        float beat_pulse = std::fabs(bounce_offset_y) / 3.0f;
+        target_pose.eyebrow_offset_y += bounce_offset_y;
+        if (!lip_sync_state.is_speaking) {
+            target_pose.head_tilt_deg += (bounce_offset_y / 3.0f) * 4.8f;
+            target_pose.eye_scale_x += beat_pulse * 0.08f;
+            target_pose.eye_scale_y += beat_pulse * 0.08f;
+            target_pose.mouth_curve_factor = std::fmax(target_pose.mouth_curve_factor, 0.82f);
+            target_pose.cheek_glow_intensity = std::fmax(target_pose.cheek_glow_intensity, 0.55f);
+        }
+    } else {
+        bounce_offset_y = 0.0f;
     }
 
     // Squash & Stretch das pálpebras e lentes durante e logo após a piscada (estilo animação Disney/Cozmo)
@@ -2851,6 +2997,10 @@ void PetController::interpolateFacePose() {
     current_pose.mouth_curve_factor   = lerp_val(current_pose.mouth_curve_factor, target_pose.mouth_curve_factor, 0.24f);
     current_pose.shake_offset_x       = target_pose.shake_offset_x;
     current_pose.shake_offset_y       = target_pose.shake_offset_y;
+
+    // Interpola suavemente a deformação física progressiva de postura curvada (slouch_drop_y até +18 px)
+    float target_slouch_drop = was_slouching_pose ? 18.0f : 0.0f;
+    slouch_drop_y = lerp_val(slouch_drop_y, target_slouch_drop, 0.14f);
 }
 
 bool PetController::isRainingOnVisor() const {
@@ -3084,6 +3234,9 @@ void PetController::renderCombatOpticEye(
     canvas.drawCircle(center_x, center_y, orb_r, COLOR_CYBER_GRID_BLUE);
 
     float spin_speed = (current_emotion == EMOTION_STARTLED || current_emotion == EMOTION_DIZZY) ? 0.0065f : 0.0020f;
+    if (cached_audio_data.is_typing_active) {
+        spin_speed += cached_audio_data.typing_click_rate * 0.0008f;
+    }
     float base_spin = static_cast<float>(now_ms) * (is_left_eye ? spin_speed : -spin_speed);
     for (int seg = 0; seg < 4; ++seg) {
         float a0 = base_spin + static_cast<float>(seg) * 1.570796f;
@@ -3167,22 +3320,43 @@ void PetController::renderCombatOpticEye(
         canvas.drawFastVLine(gl_x, gl_y - 2, 5, TFT_WHITE);
     } else {
         // Câmara escura interna do sensor óptico e anéis concêntricos na cor emocional ativa
-        canvas.fillCircle(reticle_x, reticle_y, pup_r + 3, optic_core);
-        canvas.drawCircle(reticle_x, reticle_y, pup_r + 3, optic_primary);
-        canvas.drawCircle(reticle_x, reticle_y, pup_r, TFT_WHITE);
+        int32_t flow_pulse = 0;
+        if (cached_audio_data.is_typing_active) {
+            float rate = (cached_audio_data.typing_click_rate > 1.0f) ? cached_audio_data.typing_click_rate : 3.0f;
+            flow_pulse = static_cast<int32_t>(std::round(std::sin(static_cast<float>(now_ms) * 0.008f * rate) * 1.5f));
+        }
+        int32_t eff_pup_r = pup_r + flow_pulse;
+        if (eff_pup_r < 4) eff_pup_r = 4;
 
-        // Ticks cruzados do retículo da pupila (Crosshair) em azul-gelo harmônico
-        canvas.drawFastHLine(reticle_x - pup_r - 5, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
-        canvas.drawFastHLine(reticle_x + pup_r + 2, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
-        canvas.drawFastVLine(reticle_x, reticle_y - pup_r - 5, 4, COLOR_CYBER_ICE_LIGHT);
-        canvas.drawFastVLine(reticle_x, reticle_y + pup_r + 2, 4, COLOR_CYBER_ICE_LIGHT);
+        canvas.fillCircle(reticle_x, reticle_y, eff_pup_r + 3, optic_core);
+        canvas.drawCircle(reticle_x, reticle_y, eff_pup_r + 3, optic_primary);
+        canvas.drawCircle(reticle_x, reticle_y, eff_pup_r, TFT_WHITE);
+
+        // Ticks cruzados do retículo da pupila (Crosshair) em azul-gelo harmônico (gira proporcionalmente ao Coder Flow!)
+        if (cached_audio_data.is_typing_active) {
+            float rot_speed = 0.003f + cached_audio_data.typing_click_rate * 0.0012f;
+            float ret_ang = static_cast<float>(now_ms) * (is_left_eye ? rot_speed : -rot_speed);
+            for (int k = 0; k < 4; ++k) {
+                float a = ret_ang + static_cast<float>(k) * 1.570796f;
+                int32_t x0 = reticle_x + static_cast<int32_t>(std::round(std::cos(a) * static_cast<float>(eff_pup_r + 2)));
+                int32_t y0 = reticle_y + static_cast<int32_t>(std::round(std::sin(a) * static_cast<float>(eff_pup_r + 2)));
+                int32_t x1 = reticle_x + static_cast<int32_t>(std::round(std::cos(a) * static_cast<float>(eff_pup_r + 5)));
+                int32_t y1 = reticle_y + static_cast<int32_t>(std::round(std::sin(a) * static_cast<float>(eff_pup_r + 5)));
+                canvas.drawLine(x0, y0, x1, y1, COLOR_OPTIC_EMERALD);
+            }
+        } else {
+            canvas.drawFastHLine(reticle_x - eff_pup_r - 5, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
+            canvas.drawFastHLine(reticle_x + eff_pup_r + 2, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
+            canvas.drawFastVLine(reticle_x, reticle_y - eff_pup_r - 5, 4, COLOR_CYBER_ICE_LIGHT);
+            canvas.drawFastVLine(reticle_x, reticle_y + eff_pup_r + 2, 4, COLOR_CYBER_ICE_LIGHT);
+        }
 
         // Núcleo laser brilhante + segundo ponto de brilho especular dinâmico na pupila (dá vida e simpatia ao olhar!)
         canvas.fillRect(reticle_x - 1, reticle_y - 1, 3, 3, TFT_WHITE);
-        int32_t catchlight_x = reticle_x - (pup_r / 2) - 1;
-        int32_t catchlight_y = reticle_y - (pup_r / 2) - 1;
+        int32_t catchlight_x = reticle_x - (eff_pup_r / 2) - 1;
+        int32_t catchlight_y = reticle_y - (eff_pup_r / 2) - 1;
         canvas.fillCircle(catchlight_x, catchlight_y, 2, TFT_WHITE);
-        canvas.drawPixel(reticle_x + (pup_r / 2), reticle_y + (pup_r / 2), COLOR_CYBER_ICE_LIGHT);
+        canvas.drawPixel(reticle_x + (eff_pup_r / 2), reticle_y + (eff_pup_r / 2), COLOR_CYBER_ICE_LIGHT);
         canvas.drawPixel(reticle_x, reticle_y, optic_primary);
     }
 
@@ -3582,17 +3756,26 @@ void PetController::renderEmotionalParticles(
         return;
     }
 
-    // 3. Partículas de Código ("</>", "01", "{}") subindo quando o usuário está digitando no teclado!
-    if (cached_audio_data.is_typing_cadence && current_emotion != EMOTION_SLEEPING) {
-        static const char* const CODE_TOKENS[3] = {"</>", "01", "{}"};
-        for (int i = 0; i < 3; ++i) {
-            uint32_t phase = (now_ms / 38U + static_cast<uint32_t>(i * 19)) % 44U;
-            int32_t tx = (i == 0) ? (left_eye_x - 36) : ((i == 1) ? (mid_x - 8) : (right_eye_x + 24));
-            int32_t ty = (eye_y + 8) - static_cast<int32_t>(phase / 2U);
-            if (ty > 34 && tx > 14 && tx < SCREEN_WIDTH - 28) {
-                canvas.setTextColor((i % 2 == 0) ? COLOR_OPTIC_EMERALD : COLOR_CYBER_ICE_LIGHT);
-                canvas.setCursor(tx, ty);
-                canvas.print(CODE_TOKENS[i]);
+    // 3. Partículas de Código e Bits discretos de 4px ('0' e '1') subindo nas laterais dos olhos (*Coder Flow*)
+    if (cached_audio_data.is_typing_active && current_emotion != EMOTION_SLEEPING) {
+        for (int i = 0; i < 6; ++i) {
+            uint32_t speed_div = (cached_audio_data.typing_click_rate > 4.0f) ? 24U : 34U;
+            uint32_t phase = (now_ms / speed_div + static_cast<uint32_t>(i * 11)) % 44U;
+            int32_t side_x = (i % 2 == 0)
+                                 ? (left_eye_x - 34 - ((i / 2) * 5))
+                                 : (right_eye_x + 31 + ((i / 2) * 5));
+            int32_t bit_y = (eye_y + 14) - static_cast<int32_t>(phase);
+            if (bit_y > 34 && side_x > 14 && side_x < SCREEN_WIDTH - 18) {
+                uint16_t bit_col = (i % 2 == 0) ? COLOR_OPTIC_EMERALD : COLOR_CYBER_ICE_LIGHT;
+                bool is_one = (((now_ms / 180U) + static_cast<uint32_t>(i)) % 2U) == 0U;
+                if (is_one) {
+                    // Glifo discreto '1' de 4px de altura
+                    canvas.drawFastVLine(side_x + 1, bit_y, 4, bit_col);
+                    canvas.drawPixel(side_x, bit_y + 1, bit_col);
+                } else {
+                    // Glifo discreto '0' de 3x4px
+                    canvas.drawRect(side_x, bit_y, 3, 4, bit_col);
+                }
             }
         }
     }
@@ -3713,6 +3896,7 @@ void PetController::renderPetFace(M5Canvas& canvas) {
     int32_t shake_x  = static_cast<int32_t>(current_pose.shake_offset_x);
     int32_t shake_y  = static_cast<int32_t>(current_pose.shake_offset_y);
     int32_t breath_y = static_cast<int32_t>(std::round(current_pose.breathing_offset_y));
+    int32_t slouch_y = static_cast<int32_t>(std::round(slouch_drop_y));
 
     // Quando o visor PIP estiver aberto no quadrante superior direito, desloca suavemente as órbitas para a esquerda
     // para que o olho direito jamais fique coberto pela janela da câmera/timelapse!
@@ -3720,9 +3904,9 @@ void PetController::renderPetFace(M5Canvas& canvas) {
     int32_t base_left_x  = pip_active ? 68  : FACE_EYE_LEFT_X;
     int32_t base_right_x = pip_active ? 168 : FACE_EYE_RIGHT_X;
 
-    // Posição base dos sensores ópticos acompanhando o olhar + respiração orgânica + inclinação lateral da cabeça (head roll)
+    // Posição base dos sensores ópticos acompanhando o olhar + respiração orgânica + inclinação lateral da cabeça + espelho de postura
     int32_t face_shift_x = static_cast<int32_t>(current_pose.current_eye_x * 0.40f) + shake_x;
-    int32_t face_shift_y = static_cast<int32_t>(current_pose.current_eye_y * 0.30f) + shake_y + breath_y;
+    int32_t face_shift_y = static_cast<int32_t>(current_pose.current_eye_y * 0.30f) + shake_y + breath_y + slouch_y;
     int32_t tilt_shift_y = static_cast<int32_t>(current_pose.head_tilt_deg * 0.25f);
 
     int32_t left_eye_x  = base_left_x + face_shift_x;
@@ -3766,9 +3950,9 @@ void PetController::renderPetFace(M5Canvas& canvas) {
 
     current_pose.eye_radius_current = saved_eye_r;
 
-    // 5. Boca de Retículo / Interface de Síntese Vocal centralizada com curvatura emocional e respiração sutil
+    // 5. Boca de Retículo / Interface de Síntese Vocal centralizada com curvatura emocional, respiração sutil e espelho de postura
     int32_t mouth_x = (SCREEN_WIDTH / 2) + static_cast<int32_t>(current_pose.current_eye_x * 0.30f) + shake_x;
-    int32_t mouth_y = FACE_MOUTH_BASE_Y + static_cast<int32_t>(current_pose.current_eye_y * 0.20f) + shake_y + (breath_y / 2);
+    int32_t mouth_y = FACE_MOUTH_BASE_Y + static_cast<int32_t>(current_pose.current_eye_y * 0.20f) + shake_y + (breath_y / 2) + (slouch_y / 2);
     renderSynthesisReticleMouth(canvas, mouth_x, mouth_y, now_ms);
 }
 
@@ -3822,9 +4006,12 @@ void PetController::renderTopCyberSystemsHud(M5Canvas& canvas, const GazeTargetD
     canvas.setCursor(label_x, by + 6);
     canvas.print(emotion_label);
 
-    // 2. Célula 2 (X = 91..139): Ícone 16-bit CPU Core (SD) + Indicador de Energia (5 blocos)
+    // 2. Célula 2 (X = 91..139): Ícone 16-bit CPU Core (SD) + Indicador de Energia (5 blocos, pulsa no BPM se música ativa)
     constexpr int32_t cpu_x = 92;
     constexpr int32_t cpu_y = 4;
+    int32_t hud_bounce_y = cached_audio_data.is_music_active
+                               ? static_cast<int32_t>(std::round(bounce_offset_y * 0.5f))
+                               : 0;
     if (sd_gfx_ready) {
         canvas.pushImage(cpu_x, cpu_y - 2, HUD_ICON_SIZE, HUD_ICON_SIZE, hud_icons_rgb565[0], COLOR_KEY_TRANSPARENT);
         canvas.setTextColor(COLOR_CYBER_ICE_LIGHT);
@@ -3840,7 +4027,7 @@ void PetController::renderTopCyberSystemsHud(M5Canvas& canvas, const GazeTargetD
     int32_t lit_segments = (energy_clamped * 5 + 50) / 100;
     for (int32_t seg = 0; seg < 5; ++seg) {
         int32_t sx = cpu_x + (seg * 9);
-        int32_t sy = cpu_y + 11;
+        int32_t sy = cpu_y + 11 + hud_bounce_y;
         uint16_t seg_col = COLOR_HUD_BADGE_BG;
         if (seg < lit_segments) {
             seg_col = (lit_segments >= 2) ? primary_col : COLOR_OPTIC_NEON_RED;
@@ -3851,7 +4038,7 @@ void PetController::renderTopCyberSystemsHud(M5Canvas& canvas, const GazeTargetD
 
     // 3. Célula 3 (X = 146..193): Ícone 16-bit de Mira/Foco (SD) + Tempo de Foco / Pomodoro
     constexpr int32_t foc_x = 154;
-    constexpr int32_t foc_y = 14;
+    int32_t foc_y = 14 + hud_bounce_y;
     if (sd_gfx_ready && !pomodoro_active) {
         canvas.pushImage(foc_x - 6, foc_y - 6, HUD_ICON_SIZE, HUD_ICON_SIZE, hud_icons_rgb565[1], COLOR_KEY_TRANSPARENT);
     } else {
@@ -3910,7 +4097,10 @@ void PetController::renderSideAudioVuMeters(M5Canvas& canvas, const AudioSensorD
     constexpr int32_t led_w = 7;
     constexpr int32_t led_h = 6;
     constexpr int32_t led_pitch = 9;
-    constexpr int32_t bottom_y = 136;
+    int32_t vu_bounce_y = audio_data.is_music_active
+                              ? static_cast<int32_t>(std::round(bounce_offset_y))
+                              : 0;
+    int32_t bottom_y = 136 + vu_bounce_y;
     constexpr int32_t left_x = 4;
     constexpr int32_t right_x = SCREEN_WIDTH - 11;
 
@@ -4784,6 +4974,73 @@ void PetController::renderRpgAndHabitsModal(M5Canvas& canvas, uint32_t now_ms) {
     }
 }
 
+void PetController::renderShiftDebriefOverlay(M5Canvas& canvas, uint32_t now_ms) {
+    if (now_ms >= debrief_overlay_until_ms) {
+        return;
+    }
+
+    constexpr int32_t mx = 18;
+    constexpr int32_t my = 32;
+    constexpr int32_t mw = SCREEN_WIDTH - 36;
+    constexpr int32_t mh = 112;
+
+    uint16_t primary_col = getActiveOpticPrimaryColor();
+    const UserHabitMatrix& hm = oracle_brain.getHabitMatrix();
+
+    canvas.fillRect(mx, my, mw, mh, COLOR_HUD_PANEL_BG);
+    canvas.drawRect(mx, my, mw, mh, COLOR_CYBER_ORANGE);
+    canvas.drawRect(mx + 2, my + 2, mw - 4, mh - 4, primary_col);
+
+    // Faixa de título superior do Debriefing
+    canvas.fillRect(mx + 3, my + 3, mw - 6, 16, COLOR_HUD_BADGE_BG);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextSize(1);
+    canvas.setTextColor(COLOR_CYBER_ORANGE);
+    canvas.setCursor(mx + 10, my + 7);
+    canvas.print("RESUMO DA MISSAO DIARIA [ENCERRAMENTO]");
+
+    uint32_t rem_sec = (debrief_overlay_until_ms - now_ms + 999U) / 1000U;
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setCursor(mx + mw - 28, my + 7);
+    canvas.printf("%us", static_cast<unsigned int>(rem_sec));
+
+    int32_t row_x = mx + 10;
+    int32_t row_y = my + 24;
+    constexpr int32_t row_step = 16;
+
+    // 1. Nível de RPG e XP atual
+    canvas.setTextColor(COLOR_SONAR_GREEN);
+    canvas.setCursor(row_x, row_y);
+    canvas.printf("> NIVEL RPG: LV.%02u  |  XP ACUMULADO: %u pts",
+                  static_cast<unsigned int>(hm.cyber_level),
+                  static_cast<unsigned int>(hm.xp_points));
+
+    // 2. Minutos de Foco acumulados
+    canvas.setTextColor(COLOR_CYBER_ICE_LIGHT);
+    canvas.setCursor(row_x, row_y + row_step);
+    canvas.printf("> TEMPO DE FOCO ACUMULADO: %u min",
+                  static_cast<unsigned int>(internal_stats.focus_minutes));
+
+    // 3. Cafés / Águas registrados (Hidratação & Lanches Visuais)
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setCursor(row_x, row_y + row_step * 2);
+    canvas.printf("> CAFES / AGUAS REGISTRADOS: %u recargas",
+                  static_cast<unsigned int>(hm.total_visual_feedings));
+
+    // 4. Alertas de Postura "Camarão"
+    canvas.setTextColor(hm.total_posture_warnings > 0U ? COLOR_CYBER_ORANGE : COLOR_SONAR_GREEN);
+    canvas.setCursor(row_x, row_y + row_step * 3);
+    canvas.printf("> ALERTAS POSTURA 'CAMARAO': %u ocorrencias",
+                  static_cast<unsigned int>(hm.total_posture_warnings));
+
+    // 5. Commits / Pomodoros concluídos
+    canvas.setTextColor(primary_col);
+    canvas.setCursor(row_x, row_y + row_step * 4);
+    canvas.printf("> COMMITS HOJE: %u  |  POMODOROS CONCLUIDOS: %u",
+                  static_cast<unsigned int>(git_commits_today),
+                  static_cast<unsigned int>(hm.total_pomodoros_completed));
+}
+
 void PetController::renderDebugOverlay(M5Canvas& canvas, float measured_fps, const GazeTargetData& gaze_data, const AudioSensorData& audio_data) {
     // Faixa compacta de telemetria técnica no rodapé (Y = 225..238) quando debug_mode == true (Tecla [D])
     // sem cobrir os olhos nem o visor PIP!
@@ -4814,13 +5071,17 @@ void PetController::renderDialogueAndHud(M5Canvas& canvas, float measured_fps, c
     renderSideAudioVuMeters(canvas, audio_data, now_ms);
 
     // 2.5. Visor Tático Picture-in-Picture (64x48 ou Zoom Óptico HD 160x120 [Z])
-    if (!rpg_panel_open && (pip_hd_zoom_active || debug_mode || oracle_brain.isWaitingAi() || timelapse_active || (now_ms < pip_display_until_ms))) {
+    if (!rpg_panel_open && (now_ms >= debrief_overlay_until_ms) &&
+        (pip_hd_zoom_active || debug_mode || oracle_brain.isWaitingAi() || timelapse_active || (now_ms < pip_display_until_ms))) {
         renderCyberPipVisor(canvas, gaze_data, now_ms);
     }
 
     // 2.8. Modal Interativo de RPG & Matriz de Hábitos 24h (Tecla [TAB] ou clique no Badge de Nível)
     if (rpg_panel_open) {
         renderRpgAndHabitsModal(canvas, now_ms);
+    } else if (now_ms < debrief_overlay_until_ms) {
+        // 2.9. Overlay temporário (8s) de Ritual de Encerramento de Expediente ("RESUMO DA MISSAO DIARIA")
+        renderShiftDebriefOverlay(canvas, now_ms);
     }
 
     // 3. Caixa de Diálogo de Sobreposição Tática com padding de 10px, Word-Wrap e cursor piscante

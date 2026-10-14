@@ -134,9 +134,13 @@ struct AudioSensorData {
     bool vad_keyword_mode;          // Exige a palavra-chave ("Bicho" / "Ei Bicho" / "Oráculo") para responder por voz
     bool wake_word_detected;        // Indica se a assinatura acústica da palavra-chave foi detectada na frase
     bool is_typing_cadence;         // Indica cadência de digitação mecânica (evita falso disparo de voz e premia foco)
+    bool is_typing_active;          // Indica fluxo ativo de digitação mecânica (Coder Flow)
+    float typing_click_rate;        // Taxa estimada de cliques por segundo durante digitação (Coder Flow)
     bool double_clap_detected;      // Gatilho de Duas Palmas ("Clap-Clap" 👏👏 -> acorda do modo silêncio / chama atenção)
     bool whistle_detected;          // Gatilho de Assobio Humano (tom senoidal 950Hz-2800Hz -> reação alegre imediata)
     bool music_beat_active;         // Indica batida musical rítmica ativa no ambiente
+    bool is_music_active;           // Indica modo DJ silencioso ativo (sincronia com BPM real)
+    uint32_t music_beat_interval_ms;// Intervalo entre batidas musicais em ms (BPM real captado no DSP)
     float music_beat_phase;         // Fase rítmica (0.0 a 1.0) para balanço sutil dos olhos/sobrancelhas
     bool silence_toggle_kbd_triggered; // Indica que a tecla [Q] foi pressionada para alternar Modo Silêncio
     bool pomodoro_toggle_triggered; // Gatilho para iniciar/encerrar Missão Pomodoro (Tecla [F])
@@ -394,6 +398,10 @@ public:
     const uint16_t* getPipFrameRgb565Buffer() const;
     const uint16_t* getPipHdFrameRgb565Buffer() const;
     bool hasValidPipRgb565Frame() const;
+    bool isTypingActive() const;
+    float getTypingClickRate() const;
+    bool isMusicActive() const;
+    uint32_t getMusicBeatIntervalMs() const;
 };
 
 #endif // HAL_SENSORS_H

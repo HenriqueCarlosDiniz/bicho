@@ -253,6 +253,31 @@ private:
     uint32_t last_vu_decay_ms;
     FloatingHudPopup hud_popups[MAX_HUD_POPUPS];
 
+    // 1. Micro-Expressões Oculares de "Vida" (Sacadas Rápidas, Dilatação Pupilar por Lux e Side-Eye)
+    float micro_saccade_offset_x;
+    float micro_saccade_offset_y;
+    uint32_t micro_saccade_until_ms;
+    uint32_t next_micro_saccade_ms;
+    float pupil_lux_radius_offset;
+    uint32_t side_monitor_since_ms;
+    bool is_side_eye_active;
+    int8_t side_eye_dir;
+
+    // 2. Modo DJ Silencioso (Pulso vertical sincronizado com BPM real)
+    float bounce_offset_y;
+
+    // 3. Efeito "Espelho Físico" de Postura (slouch_drop_y e detecção de alívio)
+    float slouch_drop_y;
+    bool was_slouching_pose;
+
+    // 4. Recompensa Instantânea de Git Commit
+    uint16_t prev_git_modified_files;
+    uint16_t git_commits_today;
+
+    // 5. Ritual de Encerramento de Expediente (Debriefing de Fim de Tarde)
+    bool shift_debrief_done_today;
+    uint32_t debrief_overlay_until_ms;
+
     // Métodos internos de percepção, interpolação, DSP de voz, gráficos SD e regras de negócio (camelCase)
     void updatePresenceAndFocus(const GazeTargetData& gaze_data, const AudioSensorData& audio_data, uint32_t now_ms);
     void updateAcousticReactions(const AudioSensorData& audio_data, const EnvironmentSensorData& env_data, uint32_t now_ms);
@@ -294,6 +319,7 @@ private:
     void applyVideoGlitchEffect(M5Canvas& canvas, uint32_t now_ms);
     void renderCyberPipVisor(M5Canvas& canvas, const GazeTargetData& gaze_data, uint32_t now_ms);
     void renderRpgAndHabitsModal(M5Canvas& canvas, uint32_t now_ms);
+    void renderShiftDebriefOverlay(M5Canvas& canvas, uint32_t now_ms);
     void renderDebugOverlay(M5Canvas& canvas, float measured_fps, const GazeTargetData& gaze_data, const AudioSensorData& audio_data);
 
 public:
