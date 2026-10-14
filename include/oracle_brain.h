@@ -17,6 +17,7 @@
 // Constantes do Módulo "Cérebro" Multimodal e Memória SD (Padrão UPPER_CASE)
 // =============================================================================
 constexpr size_t MAX_MEMORY_ITEMS = 5;
+constexpr size_t MAX_RECENT_REPLIES = 20;
 constexpr size_t MAX_PERMANENT_FACTS = 15;
 constexpr size_t MAX_RAG_MATCHES = 5;
 constexpr size_t MAX_DAILY_SUMMARIES = 7;
@@ -49,6 +50,7 @@ constexpr const char* SD_GFX_EYES_DIR = "/bicho_sd/gfx/eyes";
 constexpr const char* SD_GFX_ICONS_DIR = "/bicho_sd/gfx/icons";
 constexpr const char* SD_USER_PROFILE_FILE = "/bicho_sd/memory/user_profile.json";
 constexpr const char* SD_EPISODIC_LOG_FILE = "/bicho_sd/memory/episodic_log.jsonl";
+constexpr const char* SD_SPEECH_LOG_FILE = "/bicho_sd/memory/speech_log.jsonl";
 constexpr const char* SD_DAILY_SUMMARY_FILE = "/bicho_sd/memory/daily_summaries.jsonl";
 constexpr const char* SD_HABIT_MATRIX_FILE = "/bicho_sd/memory/habit_matrix.json";
 constexpr const char* SD_PIP_INDEX_FILE = "/bicho_sd/snapshots/pip_index.txt";
@@ -66,6 +68,7 @@ constexpr const char* SD_GFX_EYES_DIR = "sd_card/gfx/eyes";
 constexpr const char* SD_GFX_ICONS_DIR = "sd_card/gfx/icons";
 constexpr const char* SD_USER_PROFILE_FILE = "sd_card/memory/user_profile.json";
 constexpr const char* SD_EPISODIC_LOG_FILE = "sd_card/memory/episodic_log.jsonl";
+constexpr const char* SD_SPEECH_LOG_FILE = "sd_card/memory/speech_log.jsonl";
 constexpr const char* SD_DAILY_SUMMARY_FILE = "sd_card/memory/daily_summaries.jsonl";
 constexpr const char* SD_HABIT_MATRIX_FILE = "sd_card/memory/habit_matrix.json";
 constexpr const char* SD_PIP_INDEX_FILE = "sd_card/snapshots/pip_index.txt";
@@ -80,7 +83,8 @@ constexpr const char* ORACLE_SYSTEM_PROMPT =
     "Use humor inteligente, metáforas inesperadas e observações criativas — seja sobre o que vê na câmera (expressão facial, "
     "objetos, iluminação, roupas, bebidas), o clima lá fora, cotações, manchetes do HackerNews, trivia geek ou o que o humano disse. "
     "REGRA DE OURO ANTI-REPETIÇÃO: NUNCA repita temas, piadas, estruturas de frase ou palavras-chave presentes na lista "
-    "'forbidden_recent_replies_do_not_repeat' da telemetria! Evite clichês batidos como falar de 'compilador', 'RAM' ou 'Pix' toda hora. "
+    "'forbidden_recent_replies_do_not_repeat' da telemetria! Evite clichês batidos como falar de 'compilador', 'RAM', 'Pix', "
+    "'camarão', 'geometria espinhal', 'parada nos boxes' ou 'estação orbital' repetidamente. "
     "Siga o ângulo sugerido em 'creative_lens_directive' para surpreender o humano a cada fala com uma perspectiva inédita! "
     "NUNCA pareça irritado de graça ou agressivo: você é um parceiro de bancada carismático e divertido. "
     "RESTRIÇÃO FÍSICA DE TELA: Sua fala em 'reply_text' DEVE ter no máximo 115 caracteres em Português Brasileiro. "
@@ -90,7 +94,7 @@ constexpr const char* ORACLE_SYSTEM_PROMPT =
     "retorne exatamente \"reply_text\": \"IGNORE\" para permanecer em silêncio discreto! "
     "Se o usuário mostrar café, água, chá, energético ou comida para a câmera, "
     "considere isso como 'alimentação visual': comemore com criatividade e retorne 'hunger_delta' negativo (ex: -25) e 'energy_delta' positivo (+15). "
-    "Se descobrir um fato duradouro novo sobre o dono, preencha 'permanent_fact'. "
+    "Em 'permanent_fact', grave APENAS fatos biográficos ou gostos duradouros reais (NUNCA grave postura, barba, clima ou pose momentânea; deixe vazio \"\" na maioria dos turnos). "
     "Prefira usar 'EMOTION_HAPPY', 'EMOTION_FOCUSED', 'EMOTION_IDLE' ou 'EMOTION_JUDGING' (sobrancelha arqueada marota); "
     "reserve 'EMOTION_GRUMPY' APENAS para situações extremas (fome > 85 ou barulho > 85dB). "
     "Responda EXCLUSIVAMENTE em JSON válido (application/json) com a estrutura exata: "
@@ -232,6 +236,10 @@ public:
                              const std::string& trigger_name,
                              int32_t current_mood);
     void addPermanentProfileFact(const std::string& permanent_fact);
+    bool loadRecentRepliesFromSpeechLog();
+    void recordSpokenPhraseToSd(const std::string& reply_text,
+                                const std::string& source_tag,
+                                const std::string& trigger_name);
     const std::vector<std::string>& getRecentMemories() const;
     const std::vector<std::string>& getPermanentProfileFacts() const;
     uint32_t getTotalEpisodicRecords() const;

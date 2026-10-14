@@ -597,7 +597,9 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     }
 
     // 2.5. Reação Imediata (< 50ms, custo zero de API) a Aceno de Mão (Hand Wave) na Câmera!
-    if (gaze_data.hand_wave_detected && (now_ms - last_hand_wave_ms > 12000U)) {
+    static uint8_t local_phrase_cursor = 0U;
+
+    if (gaze_data.hand_wave_detected && (now_ms - last_hand_wave_ms > 18000U)) {
         last_hand_wave_ms = now_ms;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 4500U;
@@ -605,12 +607,17 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         oracle_brain.addXpPoints(5);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
-            speakWithLipSync(hal_sensors, "Opa! Vi seu aceno na câmera! Sensores ópticos retribuindo o cumprimento!");
+            static const char* const WAVE_PHRASES[] = {
+                "Opa! Vi seu aceno na câmera! Sensores ópticos retribuindo o cumprimento!",
+                "Saudações, comandante! Radar visual confirmou seu aceno na bancada!",
+                "Aceno recebido na lente! Sistemas prontos para mais uma rodada de código!"
+            };
+            speakWithLipSync(hal_sensors, WAVE_PHRASES[(local_phrase_cursor++) % 3U]);
         }
     }
 
     // 2.6. Visão 2.0: Reação Imediata (< 50ms, custo zero de API) a Gestos de Cabeça "SIM" (Nod) e "NÃO" (Shake)!
-    if ((gaze_data.head_nod_yes || gaze_data.head_shake_no) && (now_ms - last_head_gesture_ms > 10000U)) {
+    if ((gaze_data.head_nod_yes || gaze_data.head_shake_no) && (now_ms - last_head_gesture_ms > 15000U)) {
         last_head_gesture_ms = now_ms;
         if (gaze_data.head_nod_yes) {
             current_emotion = EMOTION_HAPPY;
@@ -619,7 +626,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.addXpPoints(4);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi() && !is_muted_indefinitely) {
-                speakWithLipSync(hal_sensors, "Afirmativo! Detectei seu aceno de cabeça dizendo SIM na câmera!");
+                static const char* const NOD_PHRASES[] = {
+                    "Afirmativo! Detectei seu aceno positivo na câmera!",
+                    "Confirmado no visual! Estamos na mesma sintonia, parceiro!",
+                    "Sinal positivo recebido pela lente! Seguindo com o plano!"
+                };
+                speakWithLipSync(hal_sensors, NOD_PHRASES[(local_phrase_cursor++) % 3U]);
             }
         } else if (gaze_data.head_shake_no) {
             current_emotion = EMOTION_JUDGING;
@@ -628,7 +640,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.addXpPoints(3);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi() && !is_muted_indefinitely) {
-                speakWithLipSync(hal_sensors, "Entendido! Vi você balançando a cabeça dizendo NÃO para o sensor óptico.");
+                static const char* const SHAKE_PHRASES[] = {
+                    "Entendido! Vi você balançando a cabeça dizendo não para a lente.",
+                    "Negativo visual registrado! Abortando essa hipótese na hora.",
+                    "Captado! Você vetou a ideia só no movimento de cabeça."
+                };
+                speakWithLipSync(hal_sensors, SHAKE_PHRASES[(local_phrase_cursor++) % 3U]);
             }
         }
     }
@@ -639,20 +656,25 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         if (is_muted_indefinitely) {
             current_emotion = EMOTION_LISTENING;
             emotion_lock_until_ms = now_ms + 4500U;
-            stopSpeakingImmediately(hal_sensors, "[SILÊNCIO INDEFINIDO ATIVO — FAÇA JOINHA, 2 PALMAS OU [Q] P/ SAIR]");
+            stopSpeakingImmediately(hal_sensors, "[SILÊNCIO INDEFINIDO ATIVO — PRESSIONE [Q], [J] OU 2 PALMAS P/ SAIR]");
             M5_LOGI("[SILENCIO] Modo Silencio Indefinido ATIVADO via tecla [Q]!");
         } else {
             current_emotion = EMOTION_HAPPY;
             emotion_lock_until_ms = now_ms + 3500U;
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-            speakWithLipSync(hal_sensors, "Modo silêncio encerrado! Voz tática do Bicho reativada na bancada.");
+            static const char* const UNMUTE_PHRASES[] = {
+                "Modo silêncio encerrado! Voz tática do Bicho reativada na bancada.",
+                "Cordas vocais cibernéticas online de novo! O que manda, chefe?",
+                "Silêncio desativado! Estou de volta na frequência da bancada."
+            };
+            speakWithLipSync(hal_sensors, UNMUTE_PHRASES[(local_phrase_cursor++) % 3U]);
             M5_LOGI("[SILENCIO] Modo Silencio Indefinido ENCERRADO via tecla [Q]!");
         }
     }
 
-    // 2.7. Visão 2.0: Reação Imediata (< 50ms, 100% local) aos 4 Gestos Táticos de Mão e Dedos!
-    // (1) 👍 Joinha ("Thumbs Up" / [J]): Elogio visual instantâneo (+8% Humor, +10 XP, EMOTION_HAPPY) e encerra Modo Silêncio!
-    if (gaze_data.gesture_thumbs_up && (now_ms - last_hand_gesture_react_ms > 4500U)) {
+    // 2.7. Reação Imediata (< 50ms, 100% local) a Palma Aberta ✋ na câmera e Joinha via tecla [J]!
+    // (1) 👍 Joinha (Tecla [J]): Elogio instantâneo (+8% Humor, +10 XP, EMOTION_HAPPY) e encerra Modo Silêncio Indefinido!
+    if (gaze_data.gesture_thumbs_up && (now_ms - last_hand_gesture_react_ms > 5500U)) {
         last_hand_gesture_react_ms = now_ms;
         bool was_muted = is_muted_indefinitely;
         is_muted_indefinitely = false; // Joinha encerra o modo silêncio indefinido!
@@ -663,17 +685,33 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         oracle_brain.addXpPoints(10);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
+            static const char* const THUMB_PHRASES[] = {
+                "Joinha recebido! Moral da bancada subiu mais 10 pontos de experiência!",
+                "Valeu pelo incentivo, parceiro! Sistemas operando com moral máxima!",
+                "Aprovação registrada! Ganhei 10 XP e motivação extra no cubo!"
+            };
             speakWithLipSync(hal_sensors, was_muted
-                ? "Joinha confirmado! Modo silêncio encerrado e moral da bancada subiu mais 10 XP!"
-                : "Joinha confirmado na lente! Valeu parceiro, moral da bancada subiu mais 10 XP!");
+                ? "Joinha recebido! Modo silêncio encerrado e sistemas prontos na bancada!"
+                : THUMB_PHRASES[(local_phrase_cursor++) % 3U]);
         }
-        M5_LOGI("[GESTO-OPTICO] Joinha (THUMBS UP) detectado! +8 Humor, +10 XP e voz ativa.");
+        M5_LOGI("[GESTO] Joinha ([J]) acionado! +8 Humor, +10 XP e voz ativa.");
     }
-    // (2) ✌️ Paz & Amor / Vitória ("V-Sign" / [K]): Dispara Selfie Tática Instantânea com Flash + Cor Real 16-bit no SD!
+    // (2) ✋ Palma Aberta ("Stop / Silêncio" / [H]): Corta a fala IMEDIATAMENTE e ativa Modo Silêncio Indefinido!
+    else if (gaze_data.gesture_open_palm && !gaze_data.gesture_thumbs_up &&
+             (lip_sync_state.is_speaking || !is_muted_indefinitely || (now_ms - last_hand_gesture_react_ms > 5500U))) {
+        last_hand_gesture_react_ms = now_ms;
+        is_muted_indefinitely = true; // Permanece em silêncio indefinidamente até tecla [Q], [J] ou 2 Palmas 👏👏!
+        pip_display_until_ms = now_ms + 5000U;
+        current_emotion = EMOTION_LISTENING;
+        emotion_lock_until_ms = now_ms + 4500U;
+        stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA (STOP) — SILÊNCIO INDEFINIDO ATIVO ([Q] OU 2 PALMAS P/ SAIR)]");
+        M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP/SILENCIO) detectada! Modo Silencio Indefinido ativado.");
+    }
+    // Atalhos de teclado dedicados ([K] Selfie Vitória):
     else if (gaze_data.gesture_victory && (now_ms - last_hand_gesture_react_ms > 5000U)) {
         last_hand_gesture_react_ms = now_ms;
-        is_muted_indefinitely = false; // Pose de vitória também encerra o modo silêncio
-        pip_optic_mode = 1U; // Ativa Cor Real 16-bit RGB565 no visor para ver a foto
+        is_muted_indefinitely = false;
+        pip_optic_mode = 1U;
         pip_display_until_ms = now_ms + 8000U;
         selfie_flash_until_ms = now_ms + 350U;
         current_emotion = EMOTION_HAPPY;
@@ -683,52 +721,17 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_camera_scan.wav").c_str());
         oracle_brain.saveEventSnapshotToSd("GESTURE_VICTORY_SELFIE");
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
-            speakWithLipSync(hal_sensors, "Pose de vitória detectada! Selfie tática capturada e salva no álbum do Cartão SD!");
+            static const char* const SELFIE_PHRASES[] = {
+                "Selfie tática capturada e salva no álbum do Cartão SD!",
+                "Foto registrada na memória externa! Ficou digna de capa de repositório!",
+                "Clique cibernético concluído! Mais uma lembrança salva no cartão SD!"
+            };
+            speakWithLipSync(hal_sensors, SELFIE_PHRASES[(local_phrase_cursor++) % 3U]);
         }
-        M5_LOGI("[GESTO-OPTICO] Paz e Amor (VICTORY V-SIGN) detectado! Selfie salva no Cartao SD.");
-    }
-    // (3) ✋ Palma Aberta ("Stop / Pause" / [H]): Corta a fala se estiver falando ou alterna/pausa o Pomodoro/Som
-    else if (gaze_data.gesture_open_palm && (lip_sync_state.is_speaking || (now_ms - last_hand_gesture_react_ms > 5000U))) {
-        last_hand_gesture_react_ms = now_ms;
-        pip_display_until_ms = now_ms + 5000U;
-        if (lip_sync_state.is_speaking) {
-            current_emotion = EMOTION_NEUTRAL;
-            emotion_lock_until_ms = now_ms + 3000U;
-            stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA (STOP) — TRANSMISSÃO INTERROMPIDA]");
-            M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP) detectada durante fala! Transmissao de voz interrompida.");
-        } else {
-            is_muted_indefinitely = false;
-            pomodoro_active = !pomodoro_active;
-            if (pomodoro_active) {
-                pomodoro_end_ms = now_ms + (25U * 60U * 1000U);
-                current_emotion = EMOTION_FOCUSED;
-                emotion_lock_until_ms = now_ms + 3500U;
-                playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-                speakWithLipSync(hal_sensors, "Gesto de Palma detectado! Missão Pomodoro de 25 minutos iniciada sem tocar no teclado!");
-            } else {
-                ambient_focus_enabled = false;
-                current_emotion = EMOTION_IDLE;
-                emotion_lock_until_ms = now_ms + 3000U;
-                stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA — MISSÃO POMODORO / SOM PAUSADOS]");
-            }
-            M5_LOGI("[GESTO-OPTICO] Palma aberta detectada! Pomodoro alternado para: %s", pomodoro_active ? "ATIVO" : "PAUSADO");
-        }
-    }
-    // (4) 🤫 Dedo na Boca ("Shhh!"): Corta o áudio IMEDIATAMENTE e mantém Modo Silêncio Indefinido até o usuário encerrar!
-    else if (!audio_data.silence_toggle_kbd_triggered &&
-             gaze_data.gesture_shhh && !gaze_data.gesture_thumbs_up && !gaze_data.gesture_victory && !gaze_data.gesture_open_palm &&
-             (lip_sync_state.is_speaking || !is_muted_indefinitely || (now_ms - last_hand_gesture_react_ms > 6000U))) {
-        last_hand_gesture_react_ms = now_ms;
-        is_muted_indefinitely = true; // Permanece em silêncio indefinidamente até ordem explícita do usuário!
-        pip_display_until_ms = now_ms + 5000U;
-        current_emotion = EMOTION_LISTENING;
-        emotion_lock_until_ms = now_ms + 4500U;
-        stopSpeakingImmediately(hal_sensors, "[GESTO: SHHH! SILÊNCIO INDEFINIDO — FAÇA JOINHA, 2 PALMAS OU [Q] P/ SAIR]");
-        M5_LOGI("[GESTO-OPTICO] Dedo na boca (SHHH) detectado! Modo Silencio Indefinido ativado.");
     }
 
     // 2.8. Ouvido 2.0: Gestos Acústicos em Tempo Real (Duas Palmas 👏👏 e Assobio 🎵) — PC e CoreS3!
-    if (audio_data.double_clap_detected && (now_ms - last_acoustic_gesture_ms > 3500U)) {
+    if (audio_data.double_clap_detected && (now_ms - last_acoustic_gesture_ms > 4500U)) {
         last_acoustic_gesture_ms = now_ms;
         if (is_muted_indefinitely) {
             is_muted_indefinitely = false;
@@ -745,10 +748,15 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             oracle_brain.addXpPoints(5);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
-                speakWithLipSync(hal_sensors, "Duas palmas confirmadas no sensor acústico! Visor óptico comutado na tela!");
+                static const char* const CLAP_PHRASES[] = {
+                    "Duas palmas confirmadas no sensor acústico! Visor óptico alternado na tela!",
+                    "Sinal de duas palmas captado! Comutando janela da câmera no HUD!",
+                    "Acústica perfeita! Alternando o monitor óptico com duas palmas!"
+                };
+                speakWithLipSync(hal_sensors, CLAP_PHRASES[(local_phrase_cursor++) % 3U]);
             }
         }
-    } else if (audio_data.whistle_detected && (now_ms - last_acoustic_gesture_ms > 6000U)) {
+    } else if (audio_data.whistle_detected && (now_ms - last_acoustic_gesture_ms > 8000U)) {
         last_acoustic_gesture_ms = now_ms;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 4500U;
@@ -756,7 +764,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         oracle_brain.addXpPoints(6);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!is_muted_indefinitely && !lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
-            speakWithLipSync(hal_sensors, "Ouvi seu assobio sintonizado no microfone! Chamou o copiloto da bancada?");
+            static const char* const WHISTLE_PHRASES[] = {
+                "Ouvi seu assobio sintonizado no microfone! Chamou o copiloto da bancada?",
+                "Frequência de assobio detectada! Estou atento por aqui, chefe!",
+                "Belo assobio! Meus filtros FFT captaram a nota musical na hora!"
+            };
+            speakWithLipSync(hal_sensors, WHISTLE_PHRASES[(local_phrase_cursor++) % 3U]);
         }
     }
 
@@ -913,6 +926,15 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
                 brain_result.new_memory.c_str(),
                 brain_result.permanent_fact.c_str(),
                 payload.reply_text);
+
+        if (std::strcmp(payload.reply_text, "IGNORE") != 0 &&
+            std::strcmp(payload.reply_text, "[IGNORE]") != 0) {
+            oracle_brain.recordSpokenPhraseToSd(
+                payload.reply_text,
+                brain_result.from_cloud_api ? "GEMINI" : "OFFLINE",
+                "ORACLE_RESPONSE"
+            );
+        }
 
         applyOracleResponse(hal_sensors, payload);
     }
@@ -2256,6 +2278,9 @@ void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_
     lip_sync_state.total_text_length = static_cast<uint16_t>(std::strlen(lip_sync_state.full_text));
     lip_sync_state.current_char_index = 0;
     lip_sync_state.is_speaking = true;
+
+    // Registra a fala no log persistente (sd_card/memory/speech_log.jsonl) e no histórico anti-repetição
+    oracle_brain.recordSpokenPhraseToSd(lip_sync_state.full_text, "LOCAL", "LOCAL_REACTION");
 
     // 1. Tenta gerar e carregar voz neural em Português (WAV PCM 16-bit 16kHz Mono) no ambiente native_pc
     using_wav_voice = generateAndLoadVoiceWav(lip_sync_state.full_text);

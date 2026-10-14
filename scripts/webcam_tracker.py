@@ -470,260 +470,80 @@ def get_hand_engine() -> MediaPipeHandEngineONNX:
 
 def detect_hand_and_shhh_gestures(frame_bgr, curr_gray, fx, fy, fw, fh, nose_x, nose_y, rm_x, rm_y, lm_x, lm_y):
     """
-    Detecta os 4 gestos manuais usando o motor neural MediaPipe HandPose 21-Keypoints ONNX
-    (com fallback geométrico à prova de barba/pescoço):
-    - gesture_shhh (🤫): Dedo indicador vertical cruzando os lábios/nariz (outros dedos dobrados)
-    - gesture_thumbs_up (👍): Polegar apontando para cima + 4 dedos fechados no punho
-    - gesture_victory (✌️): Indicador e médio estendidos em V + anelar e mínimo dobrados
-    - gesture_open_palm (✋): Palma aberta com 4 dedos estendidos
+    Detecta na câmera EXCLUSIVAMENTE o gesto manual inequívoco de Palma Aberta (✋ Stop / Silêncio)
+    usando o motor neural MediaPipe HandPose 21-Keypoints ONNX (SEM fallback de cor de pele):
+    - gesture_open_palm (✋): Palma aberta vertical com todos os 5 dedos estendidos e separados, fora da área do rosto/barba.
+    (gesture_thumbs_up, gesture_shhh e gesture_victory ficam desativados na câmera para zero falsos positivos
+    ao apoiar a mão no queixo/barba ou segurar caneca; permanecem disponíveis via teclado [J], [Q] e [K]).
     """
     gesture_shhh = 0
     gesture_thumbs_up = 0
     gesture_victory = 0
     gesture_open_palm = 0
 
-    mouth_cx = float((rm_x + lm_x) * 0.5)
-    mouth_cy = float((rm_y + lm_y) * 0.5)
+    face_cx = float(fx + fw * 0.5)
+    face_cy = float(fy + fh * 0.5)
 
-    # -------------------------------------------------------------------------
-    # CAMADA 1: Motor Neural MediaPipe 21-Keypoints 3D (ONNXRuntime)
-    # -------------------------------------------------------------------------
     try:
         engine = get_hand_engine()
         if engine.ready:
-            hands_list = engine.detect_hands_21_landmarks(frame_bgr, conf_thresh=0.52)
+            # Exige alta confiança no detector de palma ONNX (0.75) para ignorar sombras, roupas ou rosto
+            hands_list = engine.detect_hands_21_landmarks(frame_bgr, conf_thresh=0.75)
             for pts in hands_list:
                 # Índices MediaPipe:
                 # 0=WRIST | 1..4=THUMB | 5..8=INDEX | 9..12=MIDDLE | 13..16=RING | 17..20=PINKY
                 wrist = pts[0, :2]
                 palm_center = np.mean(pts[[0, 5, 9, 13, 17], :2], axis=0)
-                hand_size = max(12.0, float(np.linalg.norm(pts[9, :2] - wrist)))
+                hand_size = float(np.linalg.norm(pts[9, :2] - wrist))
 
-                def _finger_extended_up(mcp_i, pip_i, dip_i, tip_i) -> bool:
+                # Ignora detecções pequenas ou próximas do rosto/queixo/barba
+                if hand_size < 25.0:
+                    continue
+                if abs(float(palm_center[0]) - face_cx) < (fw * 0.70) and abs(float(palm_center[1]) - face_cy) < (fh * 0.85):
+                    continue
+
+                def _finger_strictly_extended_up(mcp_i, pip_i, dip_i, tip_i) -> bool:
                     d_tip_w = float(np.linalg.norm(pts[tip_i, :2] - wrist))
                     d_pip_w = float(np.linalg.norm(pts[pip_i, :2] - wrist))
                     d_tip_m = float(np.linalg.norm(pts[tip_i, :2] - pts[mcp_i, :2]))
                     d_pip_m = float(np.linalg.norm(pts[pip_i, :2] - pts[mcp_i, :2]))
-                    # Dedo estendido e apontando para cima
                     return (
-                        (d_tip_w > d_pip_w * 1.08)
-                        and (d_tip_m > d_pip_m * 1.18)
-                        and (pts[tip_i, 1] < pts[pip_i, 1] - hand_size * 0.04)
+                        (d_tip_w > d_pip_w * 1.18)
+                        and (d_tip_m > d_pip_m * 1.30)
+                        and (pts[tip_i, 1] < pts[dip_i, 1] - hand_size * 0.03)
+                        and (pts[dip_i, 1] < pts[pip_i, 1] - hand_size * 0.03)
+                        and (pts[pip_i, 1] < pts[mcp_i, 1])
                     )
 
-                def _finger_curled(mcp_i, pip_i, dip_i, tip_i) -> bool:
+                def _finger_strictly_curled(mcp_i, pip_i, dip_i, tip_i) -> bool:
                     d_tip_w = float(np.linalg.norm(pts[tip_i, :2] - wrist))
                     d_pip_w = float(np.linalg.norm(pts[pip_i, :2] - wrist))
                     d_tip_p = float(np.linalg.norm(pts[tip_i, :2] - palm_center))
                     d_mcp_p = float(np.linalg.norm(pts[mcp_i, :2] - palm_center))
                     return (
-                        (d_tip_w < d_pip_w * 1.16)
-                        or (d_tip_p < d_mcp_p * 1.38)
-                        or (pts[tip_i, 1] > pts[pip_i, 1] - hand_size * 0.02)
+                        (d_tip_w < d_pip_w * 1.06)
+                        or (d_tip_p < d_mcp_p * 1.22)
                     )
 
-                index_up = _finger_extended_up(5, 6, 7, 8)
-                middle_up = _finger_extended_up(9, 10, 11, 12)
-                ring_up = _finger_extended_up(13, 14, 15, 16)
-                pinky_up = _finger_extended_up(17, 18, 19, 20)
+                index_up = _finger_strictly_extended_up(5, 6, 7, 8)
+                middle_up = _finger_strictly_extended_up(9, 10, 11, 12)
+                ring_up = _finger_strictly_extended_up(13, 14, 15, 16)
+                pinky_up = _finger_strictly_extended_up(17, 18, 19, 20)
 
-                index_curled = _finger_curled(5, 6, 7, 8)
-                middle_curled = _finger_curled(9, 10, 11, 12)
-                ring_curled = _finger_curled(13, 14, 15, 16)
-                pinky_curled = _finger_curled(17, 18, 19, 20)
+                index_curled = _finger_strictly_curled(5, 6, 7, 8)
+                middle_curled = _finger_strictly_curled(9, 10, 11, 12)
+                ring_curled = _finger_strictly_curled(13, 14, 15, 16)
+                pinky_curled = _finger_strictly_curled(17, 18, 19, 20)
 
                 curled_count = int(index_curled) + int(middle_curled) + int(ring_curled) + int(pinky_curled)
-                up_count = int(index_up) + int(middle_up) + int(ring_up) + int(pinky_up)
 
-                # Verifica se o polegar (1..4) está apontando para cima e destacado do punho
-                thumb_tip = pts[4, :2]
-                thumb_ip = pts[3, :2]
-                thumb_mcp = pts[2, :2]
-                thumb_pointing_up = (
-                    (thumb_tip[1] < thumb_ip[1] - hand_size * 0.03)
-                    and (thumb_tip[1] < thumb_mcp[1] - hand_size * 0.14)
-                    and (thumb_tip[1] < min(pts[5, 1], pts[9, 1]) + hand_size * 0.12)
-                    and (float(np.linalg.norm(thumb_tip - pts[9, :2])) > hand_size * 0.38)
-                )
-                # Verifica também se nenhum dos 4 dedos está muito acima da ponta do polegar
-                fingers_below_thumb = all(
-                    pts[t_idx, 1] > (thumb_tip[1] - hand_size * 0.05) for t_idx in (8, 12, 16, 20)
-                )
-
-                # Verifica se o dedo indicador (ponta 8, DIP 7 ou PIP 6) está sobre a boca/nariz
-                idx_near_mouth = False
-                for pt_idx in (pts[8, :2], pts[7, :2], 0.5 * (pts[8, :2] + pts[7, :2])):
-                    if (
-                        abs(float(pt_idx[0]) - mouth_cx) <= (fw * 0.42)
-                        and (nose_y - fh * 0.20) <= float(pt_idx[1]) <= (mouth_cy + fh * 0.35)
-                    ):
-                        idx_near_mouth = True
-                        break
-
-                # (A) 👍 JOINHA (Thumbs Up): Polegar apontando para cima + dedos fechados no punho
-                if thumb_pointing_up and fingers_below_thumb and (up_count == 0 or (curled_count >= 3 and not middle_up and not ring_up)):
-                    gesture_thumbs_up = 1
-                # (B) ✌️ VITÓRIA / PAZ (V-Sign): Indicador + Médio para cima, Anelar + Mínimo dobrados
-                elif index_up and middle_up and not ring_up and not pinky_up:
-                    v_spread = float(np.linalg.norm(pts[8, :2] - pts[12, :2]))
-                    if v_spread >= hand_size * 0.15:
-                        gesture_victory = 1
-                # (C) ✋ PALMA ABERTA (Stop / Pause): Todos os 4 dedos estendidos para cima
-                elif index_up and middle_up and ring_up and pinky_up:
-                    gesture_open_palm = 1
-                # (D) 🤫 SILÊNCIO (Shhh - Dedo na Boca): Indicador estendido sobre os lábios e demais dedos dobrados
-                elif index_up and not middle_up and not ring_up and not pinky_up and idx_near_mouth and (wrist[1] > mouth_cy):
-                    gesture_shhh = 1
-
-            # Se o motor ONNX detectou qualquer gesto de mão, retorna imediatamente com prioridade limpa
-            if gesture_thumbs_up or gesture_victory or gesture_open_palm or gesture_shhh:
-                if gesture_thumbs_up or gesture_victory or gesture_open_palm:
-                    gesture_shhh = 0
-                return gesture_shhh, gesture_thumbs_up, gesture_victory, gesture_open_palm
-    except Exception:
-        pass
-
-    # -------------------------------------------------------------------------
-    # CAMADA 2: Fallback Geométrico YCrCb + Sobel (À Prova de Barba e Pescoço)
-    # -------------------------------------------------------------------------
-    try:
-        ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
-        fc_x0 = max(0, int(fx + fw * 0.25))
-        fc_x1 = min(FRAME_WIDTH, int(fx + fw * 0.75))
-        fc_y0 = max(0, int(fy + fh * 0.20))
-        fc_y1 = min(FRAME_HEIGHT, int(fy + fh * 0.60))
-        if (fc_x1 - fc_x0) >= 8 and (fc_y1 - fc_y0) >= 8:
-            face_ycrcb = ycrcb[fc_y0:fc_y1, fc_x0:fc_x1]
-            med_cr = float(np.median(face_ycrcb[:, :, 1]))
-            med_cb = float(np.median(face_ycrcb[:, :, 2]))
-            cr_min = max(125, int(med_cr - 24))
-            cr_max = min(185, int(med_cr + 24))
-            cb_min = max(70, int(med_cb - 24))
-            cb_max = min(135, int(med_cb + 24))
-        else:
-            cr_min, cr_max = 132, 178
-            cb_min, cb_max = 76, 128
-
-        skin_mask = cv2.inRange(
-            ycrcb,
-            np.array([35, cr_min, cb_min], dtype=np.uint8),
-            np.array([250, cr_max, cb_max], dtype=np.uint8),
-        )
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
-
-        # Mascara apenas a elipse facial e a base lisa do pescoço, preservando mãos ao lado ou à frente do peito
-        hand_skin = skin_mask.copy()
-        face_cx_i = int(round(fx + fw * 0.5))
-        face_cy_i = int(round(fy + fh * 0.48))
-        cv2.ellipse(
-            hand_skin,
-            (face_cx_i, face_cy_i),
-            (int(round(fw * 0.56)), int(round(fh * 0.55))),
-            0, 0, 360, 0, -1,
-        )
-        neck_x0 = max(0, int(round(fx + fw * 0.16)))
-        neck_x1 = min(FRAME_WIDTH, int(round(fx + fw * 0.84)))
-        neck_y0 = max(0, int(round(fy + fh * 0.90)))
-        hand_skin[neck_y0:FRAME_HEIGHT, neck_x0:neck_x1] = 0
-
-        contours, _ = cv2.findContours(hand_skin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            best_cnt = max(contours, key=cv2.contourArea)
-            area = float(cv2.contourArea(best_cnt))
-            min_hand_area = max(320.0, (fw * fh) * 0.13)
-            if area >= min_hand_area:
-                hx, hy, hw, hh = cv2.boundingRect(best_cnt)
-                sub_mask = np.zeros((hh, hw), dtype=np.uint8)
-                cv2.drawContours(sub_mask, [best_cnt - [hx, hy]], -1, 255, -1)
-                # Corta eventual antebraço comprido na parte inferior do contorno
-                eff_hh = min(hh, max(16, int(round(hw * 1.75))))
-                sub_mask = sub_mask[0:eff_hh, :]
-                aspect = float(eff_hh) / float(max(1, hw))
-
-                hull = cv2.convexHull(best_cnt)
-                hull_area = max(1.0, float(cv2.contourArea(hull)))
-                solidity = area / hull_area
-
-                split_y = max(4, int(round(eff_hh * 0.36)))
-                top_slice = sub_mask[0:split_y, :]
-                bot_slice = sub_mask[split_y:eff_hh, :]
-
-                top_fill = float((top_slice > 0).sum()) / float(max(1, top_slice.size))
-                bot_fill = float((bot_slice > 0).sum()) / float(max(1, bot_slice.size))
-
-                mid_top_row = top_slice[max(0, split_y // 2), :]
-                runs = 0
-                in_run = False
-                run_len = 0
-                for px_val in mid_top_row:
-                    if px_val > 0:
-                        run_len += 1
-                        if not in_run and run_len >= 2:
-                            runs += 1
-                            in_run = True
-                    else:
-                        in_run = False
-                        run_len = 0
-
-                deep_defects = 0
-                hull_idx = cv2.convexHull(best_cnt, returnPoints=False)
-                if hull_idx is not None and len(hull_idx) > 3 and len(best_cnt) >= 5:
-                    defects = cv2.convexityDefects(best_cnt, hull_idx)
-                    if defects is not None:
-                        for i in range(defects.shape[0]):
-                            _, _, f_idx, depth_fix = defects[i, 0]
-                            depth_px = float(depth_fix) / 256.0
-                            far_pt = best_cnt[f_idx][0]
-                            if depth_px >= max(7.0, eff_hh * 0.15) and (far_pt[1] - hy) <= (eff_hh * 0.72):
-                                deep_defects += 1
-
-                if runs == 1 and deep_defects <= 1 and 0.10 <= top_fill <= 0.52 and bot_fill >= 0.42 and 0.78 <= aspect <= 2.60:
-                    gesture_thumbs_up = 1
-                elif (runs == 2 or deep_defects == 1) and 0.18 <= top_fill <= 0.68 and aspect >= 0.95 and solidity < 0.88:
-                    gesture_victory = 1
-                elif (runs >= 3 or deep_defects >= 2) and area >= (min_hand_area * 1.35) and 0.45 <= solidity <= 0.86:
-                    gesture_open_palm = 1
-
-        # Fallback de Dedo na Boca ("Shhh"): exige coluna central estreita de pele CLARA contrastando com os lados da boca/barba
-        if not (gesture_thumbs_up or gesture_victory or gesture_open_palm):
-            mcx_i = int(round(mouth_cx))
-            mcy_i = int(round(mouth_cy))
-            my0 = max(0, int(round(nose_y + (mcy_i - nose_y) * 0.25)))
-            my1 = min(FRAME_HEIGHT, int(round(fy + fh * 0.96)))
-            c_x0 = max(0, mcx_i - max(3, int(round(fw * 0.06))))
-            c_x1 = min(FRAME_WIDTH, mcx_i + max(4, int(round(fw * 0.06))))
-            fl_x0 = max(0, mcx_i - max(10, int(round(fw * 0.24))))
-            fl_x1 = max(0, mcx_i - max(5, int(round(fw * 0.11))))
-            fr_x0 = min(FRAME_WIDTH, mcx_i + max(5, int(round(fw * 0.11))))
-            fr_x1 = min(FRAME_WIDTH, mcx_i + max(10, int(round(fw * 0.24))))
-
-            if (my1 - my0) >= 8 and (c_x1 - c_x0) >= 4 and (fl_x1 - fl_x0) >= 3 and (fr_x1 - fr_x0) >= 3:
-                center_skin = skin_mask[my0:my1, c_x0:c_x1]
-                flank_l_skin = skin_mask[my0:my1, fl_x0:fl_x1]
-                flank_r_skin = skin_mask[my0:my1, fr_x0:fr_x1]
-                c_skin_ratio = float((center_skin > 0).sum()) / float(max(1, center_skin.size))
-                f_skin_ratio = 0.5 * (
-                    float((flank_l_skin > 0).sum()) / float(max(1, flank_l_skin.size))
-                    + float((flank_r_skin > 0).sum()) / float(max(1, flank_r_skin.size))
-                )
-                c_luma = float(np.mean(curr_gray[my0:my1, c_x0:c_x1]))
-                f_luma = 0.5 * (
-                    float(np.mean(curr_gray[my0:my1, fl_x0:fl_x1]))
-                    + float(np.mean(curr_gray[my0:my1, fr_x0:fr_x1]))
-                )
-                mouth_roi = curr_gray[my0:my1, fl_x0:fr_x1]
-                sobel_x = float(np.mean(np.abs(cv2.Sobel(mouth_roi, cv2.CV_32F, 1, 0, ksize=3))))
-                sobel_y = float(np.mean(np.abs(cv2.Sobel(mouth_roi, cv2.CV_32F, 0, 1, ksize=3)))) + 1.0
-
-                if (
-                    c_skin_ratio >= 0.78
-                    and (c_skin_ratio - f_skin_ratio) >= 0.42
-                    and (c_luma - f_luma) >= 16.0
-                    and (sobel_x / sobel_y) >= 1.38
-                ):
-                    gesture_shhh = 1
+                # ✋ PALMA ABERTA (Stop / Silêncio): Todos os 4 dedos esticados para cima + polegar aberto + mão vertical
+                if index_up and middle_up and ring_up and pinky_up and curled_count == 0:
+                    thumb_open = float(np.linalg.norm(pts[4, :2] - pts[5, :2])) > (hand_size * 0.28)
+                    finger_spread = float(np.linalg.norm(pts[8, :2] - pts[20, :2])) > (hand_size * 0.48)
+                    palm_vertical = float(wrist[1] - pts[9, 1]) > (hand_size * 0.55)
+                    if thumb_open and finger_spread and palm_vertical:
+                        gesture_open_palm = 1
     except Exception:
         pass
 
@@ -842,28 +662,15 @@ def analyze_vision_frame(detector_tuple, frame_bgr, prev_gray=None, prev_cx=160)
             if g_shhh:
                 is_yawning = 0  # Dedo na boca não é bocejo
 
-            # 8. Detecção de Aceno de Mão (Hand Wave) na periferia superior e Objeto Mostrado na Frente
+            # 8. Detecção de Objeto Mostrado na Frente (Aceno de mão periférico desativado para evitar falsos positivos)
             hand_wave = 0
             if prev_gray is not None and abs(cx - prev_cx) <= 12:
                 diff = cv2.absdiff(curr_gray, prev_gray)
-                x0 = max(0, int(fx - 18))
-                y0 = max(0, int(fy - 14))
-                x1 = min(FRAME_WIDTH, int(fx + fw + 18))
-                y1 = min(FRAME_HEIGHT, int(fy + fh + 20))
-                diff_periph = diff.copy()
-                diff_periph[y0:y1, x0:x1] = 0
-                upper_roi = diff_periph[0:int(FRAME_HEIGHT * 0.75), :]
-                active_pixels = int((upper_roi > 28).sum())
-                if upper_roi.size > 0:
-                    motion_ratio = active_pixels / float(upper_roi.size)
-                    if 0.048 <= motion_ratio <= 0.30 and not (g_thumb or g_victory or g_shhh):
-                        hand_wave = 1
-
                 # Objeto aproximado na frente do peito/câmera (abaixo ou ao lado do rosto com alta textura)
                 lower_fg_roi = diff[int(FRAME_HEIGHT * 0.45):FRAME_HEIGHT,
                                     int(FRAME_WIDTH * 0.22):int(FRAME_WIDTH * 0.78)]
                 fg_motion = float((lower_fg_roi > 25).sum()) / float(max(1, lower_fg_roi.size))
-                if fg_motion >= 0.12 and laplacian_var >= 160.0 and not hand_wave and not g_shhh:
+                if fg_motion >= 0.12 and laplacian_var >= 160.0 and not (g_thumb or g_palm):
                     object_close = 1
 
             return (
@@ -917,7 +724,7 @@ def analyze_vision_frame(detector_tuple, frame_bgr, prev_gray=None, prev_cx=160)
 
 
 def run_continuous_face_tracker() -> int:
-    """Loop contínuo em background que rastreia rosto, postura, gestos, multi-faces, lux e PIP RGB565."""
+    """Loop contínuo em background que rastreia rosto, postura, gestos (Joinha/Palma), multi-faces, lux e PIP RGB565."""
     detector_tuple = create_face_detector()
     if detector_tuple[0] == "none":
         return 1
@@ -1039,13 +846,6 @@ def run_continuous_face_tracker() -> int:
                 last_sec_y = sec_y
                 last_face_w = int(round(last_face_w * 0.5 + face_w_int * 0.5))
 
-                if hand_wave_raw:
-                    wave_frames_acc = min(10, wave_frames_acc + 2)
-                else:
-                    wave_frames_acc = max(0, wave_frames_acc - 1)
-                if wave_frames_acc >= 4:
-                    hand_wave_confirmed = 1
-
                 if is_yawning_raw:
                     yawn_frames_acc = min(14, yawn_frames_acc + 2)
                 else:
@@ -1053,23 +853,22 @@ def run_continuous_face_tracker() -> int:
                 if yawn_frames_acc >= 6:
                     yawn_confirmed = 1
 
-                # Acumuladores de gestos manuais com prioridade para Joinha/Vitória/Palma (~140ms) e proteção anti-falso-positivo no Shhh
-                if g_thumb_raw or g_victory_raw or g_palm_raw:
-                    shhh_frames_acc = 0
+                # Acumulador estrito (exige sustentar pose firme por >= 6 frames / ~0.55s) APENAS para Joinha 👍 e Palma Aberta ✋
+                steady_scene = (scene_change_pct <= 35)
+                if g_thumb_raw and steady_scene:
+                    thumb_frames_acc = min(10, thumb_frames_acc + 1)
+                    palm_frames_acc = 0
+                elif g_palm_raw and steady_scene:
+                    palm_frames_acc = min(10, palm_frames_acc + 1)
+                    thumb_frames_acc = 0
                 else:
-                    shhh_frames_acc = min(10, shhh_frames_acc + 2) if g_shhh_raw else max(0, shhh_frames_acc - 1)
-                thumb_frames_acc = min(10, thumb_frames_acc + 2) if g_thumb_raw else max(0, thumb_frames_acc - 1)
-                victory_frames_acc = min(10, victory_frames_acc + 2) if g_victory_raw else max(0, victory_frames_acc - 1)
-                palm_frames_acc = min(10, palm_frames_acc + 2) if g_palm_raw else max(0, palm_frames_acc - 1)
+                    thumb_frames_acc = max(0, thumb_frames_acc - 2)
+                    palm_frames_acc = max(0, palm_frames_acc - 2)
 
-                if thumb_frames_acc >= 3:
+                if thumb_frames_acc >= 6:
                     thumb_confirmed = 1
-                elif victory_frames_acc >= 3:
-                    victory_confirmed = 1
-                elif palm_frames_acc >= 3:
+                elif palm_frames_acc >= 6:
                     palm_confirmed = 1
-                elif shhh_frames_acc >= 5:
-                    shhh_confirmed = 1
 
                 face_detected = 1
                 last_face_seen_time = now_sec

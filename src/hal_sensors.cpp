@@ -1,9 +1,18 @@
 #include "hal_sensors.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+
+#if __has_include(<dirent.h>)
+#include <dirent.h>
+#endif
+
+#if __has_include(<ArduinoJson.h>)
+#include <ArduinoJson.h>
+#endif
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -16,9 +25,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#if __has_include(<ArduinoJson.h>)
-#include <ArduinoJson.h>
-#endif
 #if __has_include(<esp_camera.h>)
 #include <esp_camera.h>
 #include <img_converters.h>
@@ -94,7 +100,7 @@ HalSensors::HalSensors()
       dsp_clap_stage(0),
       dsp_last_clap_ms(0),
       dsp_double_clap_latched(false),
-      dsp_whistle_Accum_ms(0),
+      dsp_whistle_accum_ms(0),
       dsp_last_whistle_ms(0),
       dsp_whistle_latched(false),
       dsp_typing_click_count(0),
@@ -472,74 +478,8 @@ void HalSensors::updateSharedVisionCalibrationAndGestures(uint32_t now_ms, bool 
         gaze_data.is_too_close = raw_close_hint;
     }
 
-    // 4. Detector Temporal de Gestos de Cabeça ("SIM" = Nod Vertical / "NÃO" = Shake Horizontal) a ~20Hz
-    if (now_ms - last_gesture_sample_ms >= 50U) {
-        last_gesture_sample_ms = now_ms;
-        gesture_hist_x[gesture_hist_head] = static_cast<int16_t>(gaze_data.raw_screen_x);
-        gesture_hist_y[gesture_hist_head] = static_cast<int16_t>(gaze_data.raw_screen_y);
-        gesture_hist_head = static_cast<uint8_t>((gesture_hist_head + 1U) % GESTURE_HISTORY_LEN);
-        if (gesture_hist_count < GESTURE_HISTORY_LEN) {
-            ++gesture_hist_count;
-        }
-
-        if (gesture_hist_count >= 12U && (now_ms - last_head_gesture_ms > 3200U)) {
-            int16_t min_x = 32767, max_x = -32767;
-            int16_t min_y = 32767, max_y = -32767;
-            int rev_x = 0, rev_y = 0;
-            int dir_x = 0, dir_y = 0;
-
-            size_t oldest_idx = (gesture_hist_head + GESTURE_HISTORY_LEN - gesture_hist_count) % GESTURE_HISTORY_LEN;
-            int16_t prev_x = gesture_hist_x[oldest_idx];
-            int16_t prev_y = gesture_hist_y[oldest_idx];
-
-            for (uint8_t i = 0; i < gesture_hist_count; ++i) {
-                size_t idx = (oldest_idx + i) % GESTURE_HISTORY_LEN;
-                int16_t x = gesture_hist_x[idx];
-                int16_t y = gesture_hist_y[idx];
-                if (x < min_x) min_x = x;
-                if (x > max_x) max_x = x;
-                if (y < min_y) min_y = y;
-                if (y > max_y) max_y = y;
-
-                int16_t dx = x - prev_x;
-                int16_t dy = y - prev_y;
-                if (std::abs(dx) >= 3) {
-                    int new_dir_x = (dx > 0) ? 1 : -1;
-                    if (dir_x != 0 && new_dir_x != dir_x) ++rev_x;
-                    dir_x = new_dir_x;
-                    prev_x = x;
-                }
-                if (std::abs(dy) >= 3) {
-                    int new_dir_y = (dy > 0) ? 1 : -1;
-                    if (dir_y != 0 && new_dir_y != dir_y) ++rev_y;
-                    dir_y = new_dir_y;
-                    prev_y = y;
-                }
-            }
-
-            int16_t span_x = max_x - min_x;
-            int16_t span_y = max_y - min_y;
-
-            // Gesto "SIM" (Nod): oscilação vertical clara (>= 13px com >= 2 inversões) e eixo X estável
-            if (span_y >= 13 && span_y <= 90 && span_x <= 12 && rev_y >= 2) {
-                nod_active_until_ms = now_ms + 950U;
-                gaze_data.head_nod_yes = true;
-                last_head_gesture_ms = now_ms;
-                gesture_hist_count = 0;
-                M5_LOGI("[VISAO-GESTO] Gesto de cabeca 'SIM' (Nod vertical) detectado! (spanY=%d, rev=%d)",
-                        static_cast<int>(span_y), rev_y);
-            }
-            // Gesto "NÃO" (Shake): oscilação horizontal clara (>= 15px com >= 2 inversões) e eixo Y estável
-            else if (span_x >= 15 && span_x <= 110 && span_y <= 12 && rev_x >= 2) {
-                shake_active_until_ms = now_ms + 950U;
-                gaze_data.head_shake_no = true;
-                last_head_gesture_ms = now_ms;
-                gesture_hist_count = 0;
-                M5_LOGI("[VISAO-GESTO] Gesto de cabeca 'NAO' (Shake horizontal) detectado! (spanX=%d, rev=%d)",
-                        static_cast<int>(span_x), rev_x);
-            }
-        }
-    }
+    // 4. Gestos de cabeça automáticos ("SIM" / "NÃO") desativados na câmera para evitar falsos positivos ao olhar para monitores laterais.
+    (void)now_ms;
 }
 
 void HalSensors::analyzeSharedPcmBlockDsp(const int16_t* samples,
@@ -660,18 +600,18 @@ void HalSensors::analyzeSharedPcmBlockDsp(const int16_t* samples,
                             (std::fabs(zcr - dsp_prev_zcr) < 0.036f) &&
                             (crest < 2.55f);
     if (is_whistle_frame) {
-        dsp_whistle_Accum_ms += block_ms;
-        if (dsp_whistle_Accum_ms >= 240U && (now_ms - dsp_last_whistle_ms > 5000U)) {
+        dsp_whistle_accum_ms += block_ms;
+        if (dsp_whistle_accum_ms >= 240U && (now_ms - dsp_last_whistle_ms > 5000U)) {
             dsp_whistle_latched = true;
             dsp_last_whistle_ms = now_ms;
-            dsp_whistle_Accum_ms = 0;
+            dsp_whistle_accum_ms = 0;
             M5_LOGI("[OUVIDO-DSP] Assobio humano detectado! (ZCR=%.3f, Vol=%.1f dB)", zcr, block_db);
         }
     } else {
-        if (dsp_whistle_Accum_ms >= block_ms) {
-            dsp_whistle_Accum_ms -= block_ms;
+        if (dsp_whistle_accum_ms >= block_ms) {
+            dsp_whistle_accum_ms -= block_ms;
         } else {
-            dsp_whistle_Accum_ms = 0;
+            dsp_whistle_accum_ms = 0;
         }
     }
 
@@ -917,6 +857,38 @@ std::string HalSensors::recordUserAudioWav() const {
         std::fclose(note_out);
     }
 
+#if __has_include(<dirent.h>)
+    // 4. Rotação de retenção de notas de voz: mantém no máximo os últimos MAX_VOICE_NOTES_FILES arquivos
+    DIR* notes_dir = opendir("sd_card/voice_notes");
+    if (notes_dir != nullptr) {
+        std::vector<std::string> voice_note_files;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(notes_dir)) != nullptr) {
+            std::string fname(entry->d_name);
+            if (fname.size() > 10 &&
+                fname.rfind("voice_", 0) == 0 &&
+                fname != "voice_last.wav" &&
+                fname != "voice_note.wav" &&
+                fname.substr(fname.size() - 4) == ".wav") {
+                voice_note_files.push_back("sd_card/voice_notes/" + fname);
+            }
+        }
+        closedir(notes_dir);
+
+        if (voice_note_files.size() > MAX_VOICE_NOTES_FILES) {
+            std::sort(voice_note_files.begin(), voice_note_files.end());
+            size_t excess_count = voice_note_files.size() - MAX_VOICE_NOTES_FILES;
+            for (size_t i = 0; i < excess_count; ++i) {
+                if (std::remove(voice_note_files[i].c_str()) == 0) {
+                    M5_LOGI("[HAL-AUDIO] Rotacao de notas de voz: arquivo antigo '%s' removido (limite=%u).",
+                            voice_note_files[i].c_str(),
+                            static_cast<unsigned int>(MAX_VOICE_NOTES_FILES));
+                }
+            }
+        }
+    }
+#endif
+
     M5_LOGI("[HAL-AUDIO] Audio real do usuario gravado (%u amostras / %u bytes WAV) e salvo em sd_card/voice_notes/.",
             static_cast<unsigned int>(pcm_samples.size()),
             static_cast<unsigned int>(wav_bytes.size()));
@@ -1092,7 +1064,7 @@ bool HalSensors::loadPetState(PersistentPetData& out_save_data) {
     if (!nvs_prefs.begin(PET_NVS_NAMESPACE, true)) {
         return false;
     }
-    if (!nvs_prefs.isKey("mood_score")) {
+    if (!nvs_prefs.isKey("mood_score") && !nvs_prefs.isKey("hunger_level")) {
         nvs_prefs.end();
         return false;
     }
@@ -1107,31 +1079,72 @@ bool HalSensors::loadPetState(PersistentPetData& out_save_data) {
     if (save_file == nullptr) {
         return false;
     }
-    char file_buffer[256] = {0};
+    char file_buffer[512] = {0};
     size_t read_bytes = std::fread(file_buffer, 1, sizeof(file_buffer) - 1, save_file);
     std::fclose(save_file);
     if (read_bytes == 0) {
         return false;
     }
+    file_buffer[read_bytes] = '\0';
 
     int hunger_v = 35;
     int mood_v = 75;
     int energy_v = 90;
     unsigned int focus_v = 0;
+    bool any_field_found = false;
 
-    int parsed_fields = std::sscanf(
-        file_buffer,
-        " { \"hunger_level\" : %d , \"mood_score\" : %d , \"energy_level\" : %d , \"focus_minutes\" : %u",
-        &hunger_v, &mood_v, &energy_v, &focus_v
-    );
+#if __has_include(<ArduinoJson.h>)
+    JsonDocument save_doc;
+    if (deserializeJson(save_doc, file_buffer) == DeserializationError::Ok) {
+        if (save_doc["hunger_level"].is<int>()) {
+            hunger_v = save_doc["hunger_level"].as<int>();
+            any_field_found = true;
+        }
+        if (save_doc["mood_score"].is<int>()) {
+            mood_v = save_doc["mood_score"].as<int>();
+            any_field_found = true;
+        }
+        if (save_doc["energy_level"].is<int>()) {
+            energy_v = save_doc["energy_level"].as<int>();
+            any_field_found = true;
+        }
+        if (save_doc["focus_minutes"].is<unsigned int>()) {
+            focus_v = save_doc["focus_minutes"].as<unsigned int>();
+            any_field_found = true;
+        }
+    }
+#endif
 
-    if (parsed_fields == 4) {
+    // Parser resiliente por chave individual (independente da ordem das chaves no JSON)
+    if (!any_field_found) {
+        auto extractIntByKey = [&](const char* key_name, int& out_val) -> bool {
+            const char* key_pos = std::strstr(file_buffer, key_name);
+            if (key_pos == nullptr) return false;
+            const char* colon_pos = std::strchr(key_pos, ':');
+            if (colon_pos == nullptr) return false;
+            return (std::sscanf(colon_pos + 1, "%d", &out_val) == 1);
+        };
+        auto extractUIntByKey = [&](const char* key_name, unsigned int& out_val) -> bool {
+            const char* key_pos = std::strstr(file_buffer, key_name);
+            if (key_pos == nullptr) return false;
+            const char* colon_pos = std::strchr(key_pos, ':');
+            if (colon_pos == nullptr) return false;
+            return (std::sscanf(colon_pos + 1, "%u", &out_val) == 1);
+        };
+
+        if (extractIntByKey("\"hunger_level\"", hunger_v))   any_field_found = true;
+        if (extractIntByKey("\"mood_score\"", mood_v))       any_field_found = true;
+        if (extractIntByKey("\"energy_level\"", energy_v))   any_field_found = true;
+        if (extractUIntByKey("\"focus_minutes\"", focus_v))  any_field_found = true;
+    }
+
+    if (any_field_found) {
         out_save_data.hunger_level  = hunger_v;
         out_save_data.mood_score    = mood_v;
         out_save_data.energy_level  = energy_v;
         out_save_data.focus_minutes = focus_v;
-        M5_LOGI("[HAL-PC] Save state carregado de '%s' (Humor=%d, Energia=%d, Foco=%um).",
-                PET_SAVE_FILE_PATH, mood_v, energy_v, focus_v);
+        M5_LOGI("[HAL-PC] Save state carregado de '%s' (Fome=%d, Humor=%d, Energia=%d, Foco=%um).",
+                PET_SAVE_FILE_PATH, hunger_v, mood_v, energy_v, focus_v);
         return true;
     }
     return false;
@@ -1143,17 +1156,28 @@ bool HalSensors::requestOracleInference(const char* state_json,
                                         size_t reply_buffer_size,
                                         PetEmotionState& out_target_emotion,
                                         int32_t& out_mood_delta,
-                                        int32_t& out_energy_delta) {
+                                        int32_t& out_energy_delta,
+                                        int32_t* out_hunger_delta,
+                                        std::string* out_new_memory,
+                                        std::string* out_permanent_fact,
+                                        std::string* out_memory_tags) {
 #if defined(ARDUINO)
+    // Prioriza sd_config.gemini_api_key (sd_card/config.json), com fallback para AI_API_KEY (secrets.h)
+    const char* active_api_key = (std::strlen(sd_config.gemini_api_key) > 10 &&
+                                  std::strcmp(sd_config.gemini_api_key, "SUA_CHAVE_DE_API_MULTIMODAL_AQUI") != 0)
+                                     ? sd_config.gemini_api_key
+                                     : AI_API_KEY;
+
     // No M5Stack CoreS3: utiliza WiFiClientSecure + HTTPClient + ArduinoJson se o Wi-Fi estiver conectado
-    if (WiFi.status() == WL_CONNECTED && std::strlen(AI_API_KEY) > 10 &&
-        std::strcmp(AI_API_KEY, "SUA_CHAVE_DE_API_MULTIMODAL_AQUI") != 0) {
+    if (WiFi.status() == WL_CONNECTED && active_api_key != nullptr &&
+        std::strlen(active_api_key) > 10 &&
+        std::strcmp(active_api_key, "SUA_CHAVE_DE_API_MULTIMODAL_AQUI") != 0) {
         WiFiClientSecure secure_client;
         secure_client.setInsecure();
         HTTPClient http_client;
 
         char full_url[256];
-        std::snprintf(full_url, sizeof(full_url), "%s?key=%s", AI_API_ENDPOINT, AI_API_KEY);
+        std::snprintf(full_url, sizeof(full_url), "%s?key=%s", AI_API_ENDPOINT, active_api_key);
 
         if (http_client.begin(secure_client, full_url)) {
             http_client.addHeader("Content-Type", "application/json");
@@ -1162,17 +1186,47 @@ bool HalSensors::requestOracleInference(const char* state_json,
 #if __has_include(<ArduinoJson.h>)
                 JsonDocument response_doc;
                 DeserializationError err = deserializeJson(response_doc, http_client.getString());
-                if (!err && response_doc["reply_text"].is<const char*>()) {
-                    std::strncpy(out_reply_text, response_doc["reply_text"].as<const char*>(), reply_buffer_size - 1);
-                    out_reply_text[reply_buffer_size - 1] = '\0';
-                    out_mood_delta = response_doc["mood_delta"] | 0;
-                    out_energy_delta = response_doc["energy_delta"] | 0;
-                    const char* emo_str = response_doc["target_emotion"] | "EMOTION_JUDGING";
-                    if (std::strcmp(emo_str, "EMOTION_HAPPY") == 0) out_target_emotion = EMOTION_HAPPY;
-                    else if (std::strcmp(emo_str, "EMOTION_GRUMPY") == 0) out_target_emotion = EMOTION_GRUMPY;
-                    else out_target_emotion = EMOTION_JUDGING;
-                    http_client.end();
-                    return true;
+                if (!err) {
+                    // Extrai primeiro a string JSON interna de candidates[0].content.parts[0].text (padrão generateContent)
+                    JsonDocument inner_doc;
+                    JsonVariantConst payload_obj;
+                    const char* inner_text = response_doc["candidates"][0]["content"]["parts"][0]["text"] | nullptr;
+                    if (inner_text != nullptr && deserializeJson(inner_doc, inner_text) == DeserializationError::Ok) {
+                        payload_obj = inner_doc.as<JsonVariantConst>();
+                    } else {
+                        payload_obj = response_doc.as<JsonVariantConst>();
+                    }
+
+                    if (payload_obj["reply_text"].is<const char*>()) {
+                        std::strncpy(out_reply_text, payload_obj["reply_text"].as<const char*>(), reply_buffer_size - 1);
+                        out_reply_text[reply_buffer_size - 1] = '\0';
+                        out_mood_delta = payload_obj["mood_delta"] | 0;
+                        out_energy_delta = payload_obj["energy_delta"] | 0;
+
+                        int32_t parsed_hunger_delta = payload_obj["hunger_delta"] | 0;
+                        const char* parsed_new_memory = payload_obj["new_memory"] | "";
+                        const char* parsed_perm_fact = payload_obj["permanent_fact"] | "";
+                        const char* parsed_mem_tags = payload_obj["memory_tags"] | "";
+
+                        if (out_hunger_delta != nullptr)   *out_hunger_delta = parsed_hunger_delta;
+                        if (out_new_memory != nullptr)     *out_new_memory = parsed_new_memory;
+                        if (out_permanent_fact != nullptr) *out_permanent_fact = parsed_perm_fact;
+                        if (out_memory_tags != nullptr)    *out_memory_tags = parsed_mem_tags;
+
+                        const char* emo_str = payload_obj["target_emotion"] | "EMOTION_JUDGING";
+                        if (std::strcmp(emo_str, "EMOTION_IDLE") == 0)          out_target_emotion = EMOTION_IDLE;
+                        else if (std::strcmp(emo_str, "EMOTION_FOCUSED") == 0)  out_target_emotion = EMOTION_FOCUSED;
+                        else if (std::strcmp(emo_str, "EMOTION_STARTLED") == 0) out_target_emotion = EMOTION_STARTLED;
+                        else if (std::strcmp(emo_str, "EMOTION_SLEEPING") == 0) out_target_emotion = EMOTION_SLEEPING;
+                        else if (std::strcmp(emo_str, "EMOTION_JUDGING") == 0)  out_target_emotion = EMOTION_JUDGING;
+                        else if (std::strcmp(emo_str, "EMOTION_HAPPY") == 0)    out_target_emotion = EMOTION_HAPPY;
+                        else if (std::strcmp(emo_str, "EMOTION_GRUMPY") == 0)   out_target_emotion = EMOTION_GRUMPY;
+                        else if (std::strcmp(emo_str, "EMOTION_DIZZY") == 0)    out_target_emotion = EMOTION_DIZZY;
+                        else                                                    out_target_emotion = EMOTION_JUDGING;
+
+                        http_client.end();
+                        return true;
+                    }
                 }
 #endif
             }
@@ -1187,6 +1241,10 @@ bool HalSensors::requestOracleInference(const char* state_json,
     (void)out_target_emotion;
     (void)out_mood_delta;
     (void)out_energy_delta;
+    (void)out_hunger_delta;
+    (void)out_new_memory;
+    (void)out_permanent_fact;
+    (void)out_memory_tags;
     return false;
 #endif
 }
@@ -1301,11 +1359,20 @@ void HalSensors::initCoreS3Peripherals() {
     }
 #endif
 
-    // 4. Conecta ao Wi-Fi configurado em sd_card/config.json (ou secrets.h) se houver SSID válido
-    if (std::strlen(sd_config.wifi_ssid) > 0 && std::strcmp(sd_config.wifi_ssid, "SEU_WIFI_SSID") != 0) {
+    // 4. Conecta ao Wi-Fi priorizando sd_card/config.json com fallback para secrets.h
+    const char* active_wifi_ssid = (std::strlen(sd_config.wifi_ssid) > 0 &&
+                                    std::strcmp(sd_config.wifi_ssid, "SEU_WIFI_SSID") != 0)
+                                       ? sd_config.wifi_ssid
+                                       : WIFI_SSID;
+    const char* active_wifi_pass = (std::strlen(sd_config.wifi_password) > 0 &&
+                                    std::strcmp(sd_config.wifi_password, "SUA_SENHA_WIFI") != 0)
+                                       ? sd_config.wifi_password
+                                       : WIFI_PASSWORD;
+    if (active_wifi_ssid != nullptr && std::strlen(active_wifi_ssid) > 0 &&
+        std::strcmp(active_wifi_ssid, "SEU_WIFI_SSID") != 0) {
         WiFi.mode(WIFI_STA);
-        WiFi.begin(sd_config.wifi_ssid, sd_config.wifi_password);
-        M5_LOGI("[HAL-CORES3] Conectando ao Wi-Fi '%s'...", sd_config.wifi_ssid);
+        WiFi.begin(active_wifi_ssid, active_wifi_pass);
+        M5_LOGI("[HAL-CORES3] Conectando ao Wi-Fi '%s'...", active_wifi_ssid);
     }
 }
 
@@ -1390,7 +1457,8 @@ void HalSensors::readCoreS3CameraGaze() {
             uint32_t sc_pct = (diff_acc * 100U) / (64U * 48U);
             if (sc_pct > 100U) sc_pct = 100U;
             gaze_data.scene_change_pct = static_cast<uint8_t>(sc_pct);
-            gaze_data.hand_wave_detected = (top_corner_motion > 260U);
+            (void)top_corner_motion;
+            gaze_data.hand_wave_detected = false;
 
             // Se o sensor LTR-553ALS não estiver presente, estima Lux pela câmera GC0308
             if (!cores3_ltr553_initialized) {
@@ -1448,9 +1516,8 @@ void HalSensors::readCoreS3CameraGaze() {
                 raw_slouch = (gaze_data.raw_screen_y > 165);
                 raw_close = (gaze_data.face_width_px > 125);
 
-                // 2d. Detecção Embarcada de Gestos de Mão Lateral (Joinha 👍, Vitória ✌️, Palma Aberta ✋) no GC0308
-                bool lateral_hand_gesture = false;
-                if (count2 >= 8 && max_y2 > min_y2 + 2 && max_x2 > min_x2 + 2) {
+                // 2d. Detecção Embarcada Estrita de Gestos de Mão Lateral APENAS para Joinha 👍 e Palma Aberta ✋ no GC0308
+                if (sc_pct <= 25U && count2 >= 12 && max_y2 > min_y2 + 4 && max_x2 > min_x2 + 3) {
                     int max_top_runs = 0;
                     int top_skin_cols = 0;
                     int top_end_y = (min_y2 + 3 <= max_y2) ? (min_y2 + 3) : max_y2;
@@ -1472,46 +1539,10 @@ void HalSensors::readCoreS3CameraGaze() {
                     }
                     int hand_w = max_x2 - min_x2 + 1;
                     int hand_h = max_y2 - min_y2 + 1;
-                    if (max_top_runs == 1 && (hand_h * 4) >= (hand_w * 3) && top_skin_cols <= (hand_w * 2 + 2)) {
-                        thumb_active_until_ms = now_ms + 1100U;
-                        shhh_active_until_ms = 0;
-                        lateral_hand_gesture = true;
-                    } else if (max_top_runs == 2) {
-                        victory_active_until_ms = now_ms + 1100U;
-                        shhh_active_until_ms = 0;
-                        lateral_hand_gesture = true;
-                    } else if (max_top_runs >= 3 || count2 >= 36) {
-                        palm_active_until_ms = now_ms + 1100U;
-                        shhh_active_until_ms = 0;
-                        lateral_hand_gesture = true;
-                    }
-                }
-
-                // 2e. Detecção Embarcada de Dedo na Boca ("Shhh!" — gesture_shhh) no GC0308 (à prova de barba/pescoço):
-                if (!lateral_hand_gesture) {
-                    int mx0 = (cx_pip - 2 > 2) ? (cx_pip - 2) : 2;
-                    int mx1 = (cx_pip + 2 < PIP_FRAME_WIDTH - 3) ? (cx_pip + 2) : (PIP_FRAME_WIDTH - 3);
-                    int my0 = (cy_pip + 1 > 2) ? (cy_pip + 1) : 2;
-                    int my1 = (cy_pip + 6 < PIP_FRAME_HEIGHT - 3) ? (cy_pip + 6) : (PIP_FRAME_HEIGHT - 3);
-                    uint32_t vert_grad = 0;
-                    uint32_t horiz_grad = 0;
-                    int center_skin_pts = 0;
-                    int flank_skin_pts = 0;
-                    for (int my = my0; my <= my1; ++my) {
-                        for (int mx = mx0; mx <= mx1; ++mx) {
-                            int gx_v = std::abs(static_cast<int>(pip_frame_gray[my * PIP_FRAME_WIDTH + (mx + 1)]) -
-                                                static_cast<int>(pip_frame_gray[my * PIP_FRAME_WIDTH + (mx - 1)]));
-                            int gy_h = std::abs(static_cast<int>(pip_frame_gray[(my + 1) * PIP_FRAME_WIDTH + mx]) -
-                                                static_cast<int>(pip_frame_gray[(my - 1) * PIP_FRAME_WIDTH + mx]));
-                            vert_grad += static_cast<uint32_t>(gx_v);
-                            horiz_grad += static_cast<uint32_t>(gy_h);
-                            if (skin_mask[my * PIP_FRAME_WIDTH + mx]) ++center_skin_pts;
-                        }
-                        if (mx0 - 2 >= 0 && skin_mask[my * PIP_FRAME_WIDTH + (mx0 - 2)]) ++flank_skin_pts;
-                        if (mx1 + 2 < PIP_FRAME_WIDTH && skin_mask[my * PIP_FRAME_WIDTH + (mx1 + 2)]) ++flank_skin_pts;
-                    }
-                    if (center_skin_pts >= 12 && flank_skin_pts <= 4 && vert_grad > (horiz_grad * 3U) / 2U) {
-                        shhh_active_until_ms = now_ms + 1100U;
+                    if (max_top_runs == 1 && (hand_h * 3) >= (hand_w * 4) && top_skin_cols <= (hand_w + 2)) {
+                        thumb_active_until_ms = now_ms + 900U;
+                    } else if (max_top_runs >= 4 && count2 >= 42) {
+                        palm_active_until_ms = now_ms + 900U;
                     }
                 }
 
@@ -1756,9 +1787,9 @@ void HalSensors::readCoreS3OnboardSensors() {
                     gaze_data.scene_change_pct = static_cast<uint8_t>(sc);
                 }
                 if (n >= 22) {
-                    if (shhh_s != 0) shhh_active_until_ms = now_ms + 950U;
-                    if (thumb_s != 0) thumb_active_until_ms = now_ms + 950U;
-                    if (vict_s != 0) victory_active_until_ms = now_ms + 950U;
+                    (void)shhh_s;
+                    (void)thumb_s;
+                    (void)vict_s;
                     if (palm_s != 0) palm_active_until_ms = now_ms + 950U;
                 }
                 updateSharedVisionCalibrationAndGestures(now_ms, sl != 0, cl != 0);
@@ -2110,20 +2141,12 @@ bool HalSensors::readWebcamTrackerFile(int32_t& out_face_x, int32_t& out_face_y,
 
     uint32_t now_ms = M5.millis();
     if (parsed >= 26) {
-        if (thumb_v != 0) {
-            thumb_active_until_ms = now_ms + 950U;
-            shhh_active_until_ms = 0;
-        }
-        if (victory_v != 0) {
-            victory_active_until_ms = now_ms + 950U;
-            shhh_active_until_ms = 0;
-        }
+        (void)thumb_v;
+        (void)victory_v;
+        (void)shhh_v;
         if (palm_v != 0) {
             palm_active_until_ms = now_ms + 950U;
             shhh_active_until_ms = 0;
-        }
-        if (shhh_v != 0 && thumb_v == 0 && victory_v == 0 && palm_v == 0) {
-            shhh_active_until_ms = now_ms + 950U;
         }
     }
 

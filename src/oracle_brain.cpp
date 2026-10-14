@@ -118,7 +118,7 @@ OracleBrain::~OracleBrain() {
 void OracleBrain::initBrain() {
     sd_storage_ready = initSdCardDirectories();
 
-    // Carrega Perfil Permanente (Nível 1) e Matriz de Hábitos (Nível 4) do Cartão SD
+    // Carrega Perfil Permanente (Nível 1), Matriz de Hábitos (Nível 4) e Histórico de Falas no Cartão SD
     if (sd_storage_ready) {
         if (!loadPermanentProfileFromSd()) {
             permanent_profile_facts.clear();
@@ -130,6 +130,7 @@ void OracleBrain::initBrain() {
             habit_matrix.cyber_level = 1;
             saveHabitMatrixToSd();
         }
+        loadRecentRepliesFromSpeechLog();
     }
 
     // Carrega memórias episódicas (Nível 2) ou migra automaticamente de oracle_memories.json
@@ -591,12 +592,14 @@ bool OracleBrain::parseGeminiStructuredJson(const std::string& raw_api_response,
     out_response.memory_tags = truncateUtf8Reply(parsed_tags, 60);
     out_response.from_cloud_api = true;
 
-    // Registra a fala nas últimas 6 respostas para bloquear repetição de piadas/temas nos próximos turnos
-    if (!out_response.reply_text.empty()) {
-        if (recent_replies.size() >= 6) {
-            recent_replies.erase(recent_replies.begin());
+    // Registra a fala nas últimas MAX_RECENT_REPLIES (20) respostas para bloquear repetição de piadas/temas nos próximos turnos
+    if (!out_response.reply_text.empty() && out_response.reply_text != "IGNORE" && out_response.reply_text != "[IGNORE]") {
+        if (recent_replies.empty() || recent_replies.back() != out_response.reply_text) {
+            if (recent_replies.size() >= MAX_RECENT_REPLIES) {
+                recent_replies.erase(recent_replies.begin());
+            }
+            recent_replies.push_back(out_response.reply_text);
         }
-        recent_replies.push_back(out_response.reply_text);
     }
 
     M5_LOGI("[OracleBrain] Resposta Gemini (Flash-Lite) recebida: \"%s\" [%s] | PermFact='%s' | Tags='%s'",
@@ -1128,6 +1131,19 @@ void OracleBrain::addPermanentProfileFact(const std::string& permanent_fact) {
     }
     std::string clean_fact = truncateUtf8Reply(permanent_fact, 90);
     std::string low_new = toLowerAscii(clean_fact);
+
+    // Bloqueia gravação de estados efêmeros de câmera/clima como fatos permanentes para evitar eco nos prompts
+    static const char* const TRANSIENT_NOISE_WORDS[] = {
+        "postura", "camarão", "camarao", "espinhal", "vertebral", "queixo",
+        "barba", "bigode", "ausente", "cadeira", "tempestade", "boxes",
+        "órbita", "orbita", "espécime", "especime", "pista molhada"
+    };
+    for (size_t i = 0; i < sizeof(TRANSIENT_NOISE_WORDS) / sizeof(TRANSIENT_NOISE_WORDS[0]); ++i) {
+        if (low_new.find(TRANSIENT_NOISE_WORDS[i]) != std::string::npos) {
+            return;
+        }
+    }
+
     for (const auto& existing : permanent_profile_facts) {
         if (toLowerAscii(existing) == low_new) {
             return;
@@ -1139,6 +1155,141 @@ void OracleBrain::addPermanentProfileFact(const std::string& permanent_fact) {
     permanent_profile_facts.push_back(clean_fact);
     savePermanentProfileToSd();
     M5_LOGI("[SD-PERFIL] Novo fato duradouro gravado no Cartao SD: '%s'", clean_fact.c_str());
+}
+
+bool OracleBrain::loadRecentRepliesFromSpeechLog() {
+    if (!sd_storage_ready) {
+        return false;
+    }
+
+    std::string content;
+#if defined(ARDUINO)
+    if (!SD.exists(SD_SPEECH_LOG_FILE)) {
+        return false;
+    }
+    File f = SD.open(SD_SPEECH_LOG_FILE, FILE_READ);
+    if (!f) {
+        return false;
+    }
+    while (f.available()) {
+        content.push_back(static_cast<char>(f.read()));
+    }
+    f.close();
+#else
+    std::ifstream f(SD_SPEECH_LOG_FILE, std::ios::binary);
+    if (!f.is_open()) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    content = ss.str();
+#endif
+
+    if (content.empty()) {
+        return false;
+    }
+
+    std::vector<std::string> loaded_replies;
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t end_line = content.find('\n', pos);
+        if (end_line == std::string::npos) {
+            end_line = content.size();
+        }
+        std::string line = content.substr(pos, end_line - pos);
+        pos = end_line + 1;
+
+        std::string reply_val;
+        if (extractJsonStringField(line, "reply", reply_val) && !reply_val.empty()) {
+            loaded_replies.push_back(reply_val);
+        }
+    }
+
+    if (loaded_replies.empty()) {
+        return false;
+    }
+
+    recent_replies.clear();
+    size_t start_idx = (loaded_replies.size() > MAX_RECENT_REPLIES)
+                           ? (loaded_replies.size() - MAX_RECENT_REPLIES)
+                           : 0;
+    for (size_t i = start_idx; i < loaded_replies.size(); ++i) {
+        if (recent_replies.empty() || recent_replies.back() != loaded_replies[i]) {
+            recent_replies.push_back(loaded_replies[i]);
+        }
+    }
+
+    M5_LOGI("[SD-FALAS] Historico anti-repeticao restaurado do SD: %u falas recentes carregadas.",
+            static_cast<unsigned int>(recent_replies.size()));
+    return true;
+}
+
+void OracleBrain::recordSpokenPhraseToSd(const std::string& reply_text,
+                                         const std::string& source_tag,
+                                         const std::string& trigger_name) {
+    if (reply_text.empty() || reply_text == "IGNORE" || reply_text == "[IGNORE]") {
+        return;
+    }
+
+    static std::string last_logged_sd_reply;
+    if (source_tag == "LOCAL" && last_logged_sd_reply == reply_text) {
+        return;
+    }
+    last_logged_sd_reply = reply_text;
+
+    // 1. Mantém a lista em RAM das últimas MAX_RECENT_REPLIES (20) falas sempre sincronizada
+    if (recent_replies.empty() || recent_replies.back() != reply_text) {
+        if (recent_replies.size() >= MAX_RECENT_REPLIES) {
+            recent_replies.erase(recent_replies.begin());
+        }
+        recent_replies.push_back(reply_text);
+    }
+
+    if (!sd_storage_ready) {
+        return;
+    }
+
+    // 2. Calcula o mesmo hash FNV-1a usado no arquivo WAV do cache TTS (tts_<hash>.wav)
+    uint32_t fnv_hash = 2166136261U;
+    for (size_t i = 0; i < reply_text.size(); ++i) {
+        fnv_hash ^= static_cast<uint8_t>(reply_text[i]);
+        fnv_hash *= 16777619U;
+    }
+    char wav_name[32];
+    std::snprintf(wav_name, sizeof(wav_name), "tts_%08x.wav", static_cast<unsigned int>(fnv_hash));
+
+    std::string date_str;
+    uint8_t hour_val = 0;
+    getCurrentDateAndHour(date_str, hour_val);
+
+    char line_buf[640];
+    std::snprintf(
+        line_buf,
+        sizeof(line_buf),
+        "{\"date\":\"%s\",\"hour\":%u,\"source\":\"%s\",\"trigger\":\"%s\",\"wav\":\"%s\",\"reply\":\"%s\"}\n",
+        escapeJsonString(date_str).c_str(),
+        static_cast<unsigned int>(hour_val),
+        escapeJsonString(source_tag.empty() ? "LOCAL" : source_tag).c_str(),
+        escapeJsonString(trigger_name.empty() ? "DIRECT_SPEECH" : trigger_name).c_str(),
+        wav_name,
+        escapeJsonString(reply_text).c_str()
+    );
+
+#if defined(ARDUINO)
+    File f = SD.open(SD_SPEECH_LOG_FILE, FILE_APPEND);
+    if (!f) {
+        f = SD.open(SD_SPEECH_LOG_FILE, FILE_WRITE);
+    }
+    if (f) {
+        f.print(line_buf);
+        f.close();
+    }
+#else
+    std::ofstream f(SD_SPEECH_LOG_FILE, std::ios::binary | std::ios::app);
+    if (f.is_open()) {
+        f.write(line_buf, static_cast<std::streamsize>(std::strlen(line_buf)));
+    }
+#endif
 }
 
 bool OracleBrain::appendEpisodicRecordToSd(const EpisodicMemoryRecord& record) {
