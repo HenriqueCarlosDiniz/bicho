@@ -47,6 +47,8 @@ constexpr uint16_t COLOR_ARMOR_HIGHLIGHT = 0x52AA;   // Chanfro iluminado da arm
 constexpr uint16_t COLOR_CYBER_ORANGE    = 0xFD20;   // Âmbar dourado tático
 constexpr uint16_t COLOR_CYBER_YELLOW    = 0xFFE0;   // Amarelo de warning eletrônico
 constexpr uint16_t COLOR_SONAR_GREEN     = 0x07E8;   // Verde esmeralda tático
+constexpr uint16_t COLOR_CYBER_GREEN     = 0x07E8;   // Verde cibernético para popups de XP/afeto
+constexpr uint16_t COLOR_OPTIC_EMERALD   = 0x07E8;   // Verde esmeralda óptico para partículas e bochechas
 constexpr uint16_t COLOR_TEXT_SHADOW     = 0x0000;   // Sombra projetada preta
 
 // Mantém constantes originais para compatibilidade de escopo
@@ -165,21 +167,39 @@ PetController::PetController()
       last_acoustic_gesture_ms(0),
       is_muted_indefinitely(false),
       selfie_flash_until_ms(0),
-      rain_simulation_override(false),
-      visor_raindrops(),
       saccade_offset_x(0.0f),
       saccade_offset_y(0.0f),
-      next_saccade_ms(0)
+      next_saccade_ms(0),
+      rain_simulation_override(false),
+      visor_raindrops(),
+      head_pat_until_ms(0),
+      last_head_pat_reward_ms(0),
+      wink_until_ms(0),
+      next_wink_ms(14000),
+      blink_bounce_until_ms(0),
+      last_touch_x(-1),
+      last_touch_y(-1),
+      touch_stroke_accum(0.0f),
+      vu_peak_left(2),
+      vu_peak_right(2),
+      last_vu_decay_ms(0),
+      hud_popups()
 {
     internal_stats = {20, 86, 88, 0, 0, 0};
     current_pose = {
         0.0f, 0.0f,
         0.0f, 0.0f,
         FACE_EYE_DEFAULT_R, FACE_PUPIL_DEFAULT_R,
-        0.10f, 0.25f,
-        -2.0f, -1.5f, 0.0f,
+        0.0f, 0.18f,
+        -4.0f, -2.0f, 0.0f,
         MOUTH_CLOSED_HEIGHT, 26.0f, 0.55f,
-        0.0f, 0.0f
+        0.0f, 0.0f,
+        1.0f, 1.0f,
+        0.0f, 0.0f,
+        0.18f, 0.18f,
+        -4.0f, 4.0f,
+        -2.0f, -2.0f,
+        0.0f, 0.25f
     };
     target_pose = current_pose;
     std::memset(&lip_sync_state, 0, sizeof(lip_sync_state));
@@ -191,7 +211,37 @@ PetController::PetController()
     std::memset(eye_lens_textures_rgb565, 0, sizeof(eye_lens_textures_rgb565));
     std::memset(hud_icons_rgb565, 0, sizeof(hud_icons_rgb565));
     std::memset(visor_raindrops, 0, sizeof(visor_raindrops));
+    std::memset(hud_popups, 0, sizeof(hud_popups));
     initVisorRainDrops();
+}
+
+void PetController::spawnHudPopup(const char* text, float x, float y, uint16_t color, uint32_t duration_ms) {
+    if (text == nullptr || text[0] == '\0') {
+        return;
+    }
+    uint32_t now_ms = M5.millis();
+    int32_t chosen_idx = 0;
+    uint32_t oldest_spawn = 0xFFFFFFFFU;
+    for (uint8_t i = 0; i < MAX_HUD_POPUPS; ++i) {
+        if (!hud_popups[i].active || now_ms >= hud_popups[i].expire_ms) {
+            chosen_idx = static_cast<int32_t>(i);
+            break;
+        }
+        if (hud_popups[i].spawn_ms < oldest_spawn) {
+            oldest_spawn = hud_popups[i].spawn_ms;
+            chosen_idx = static_cast<int32_t>(i);
+        }
+    }
+    FloatingHudPopup& p = hud_popups[chosen_idx];
+    std::strncpy(p.text, text, sizeof(p.text) - 1);
+    p.text[sizeof(p.text) - 1] = '\0';
+    p.x = x;
+    p.y = y;
+    p.vy = -0.38f;
+    p.color = color;
+    p.spawn_ms = now_ms;
+    p.expire_ms = now_ms + duration_ms;
+    p.active = true;
 }
 
 bool PetController::isDistractionWindow(const char* window_title) const {
@@ -312,11 +362,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     uint32_t prev_focus = internal_stats.focus_minutes;
     int32_t prev_mood = internal_stats.mood_score;
 
-    // 0. Roteamento de Toque / Clique Direto na Tela (UI Clicável / Hotspots Táticos sem depender de teclado)
+    // 0. Roteamento de Toque / Clique Direto na Tela (UI Clicável / Hotspots Táticos + Cafuné na Testa)
     bool touch_rising_edge = (gaze_data.touch_active && !prev_touch_active);
     prev_touch_active = gaze_data.touch_active;
 
     bool touch_poke_face    = false;
+    bool touch_head_pat     = false;
     bool touch_pomodoro     = false;
     bool touch_ambient      = false;
     bool touch_timelapse    = false;
@@ -328,15 +379,39 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     bool touch_replay_vn    = false;
     bool touch_rpg_modal    = false;
 
-    if (touch_rising_edge) {
-        int32_t tx = gaze_data.raw_screen_x;
-        int32_t ty = gaze_data.raw_screen_y;
-        bool pip_visible = pip_hd_zoom_active || debug_mode || oracle_brain.isWaitingAi() || timelapse_active || (now_ms < pip_display_until_ms);
-        int32_t pip_x0 = pip_hd_zoom_active ? 78 : 232;
-        int32_t pip_y0 = pip_hd_zoom_active ? 30 : 34;
-        int32_t pip_x1 = pip_x0 + (pip_hd_zoom_active ? 164 : 68);
-        int32_t pip_y1 = pip_y0 + (pip_hd_zoom_active ? 132 : 60);
+    int32_t tx = gaze_data.raw_screen_x;
+    int32_t ty = gaze_data.raw_screen_y;
+    bool pip_visible = pip_hd_zoom_active || debug_mode || oracle_brain.isWaitingAi() || timelapse_active || (now_ms < pip_display_until_ms);
+    int32_t pip_x0 = pip_hd_zoom_active ? 78 : 232;
+    int32_t pip_y0 = pip_hd_zoom_active ? 30 : 34;
+    int32_t pip_x1 = pip_x0 + (pip_hd_zoom_active ? 164 : 68);
+    int32_t pip_y1 = pip_y0 + (pip_hd_zoom_active ? 132 : 60);
 
+    // Detecção contínua de Cafuné / Carinho por arrasto sobre a testa e órbitas (Y = 30..112)
+    if (gaze_data.touch_active && !rpg_panel_open &&
+        !(pip_visible && tx >= pip_x0 && tx <= pip_x1 && ty >= pip_y0 && ty <= pip_y1) &&
+        ty >= 30 && ty <= 112 && tx >= 42 && tx <= 278) {
+        if (last_touch_x >= 0 && last_touch_y >= 0) {
+            float dx = static_cast<float>(tx - last_touch_x);
+            float dy = static_cast<float>(ty - last_touch_y);
+            float step_dist = std::sqrt(dx * dx + dy * dy);
+            if (step_dist >= 1.5f && step_dist <= 65.0f) {
+                touch_stroke_accum += step_dist;
+            }
+        }
+        last_touch_x = tx;
+        last_touch_y = ty;
+        if (touch_stroke_accum >= 18.0f) {
+            touch_stroke_accum = 0.0f;
+            touch_head_pat = true;
+        }
+    } else if (!gaze_data.touch_active) {
+        last_touch_x = -1;
+        last_touch_y = -1;
+        touch_stroke_accum = 0.0f;
+    }
+
+    if (touch_rising_edge) {
         if (ty <= 28) {
             if (tx < 88) {
                 touch_rpg_modal = true; // Célula 1 (Badge Poligonal): Abre/Fecha Modal de RPG & Matriz de Hábitos
@@ -370,8 +445,25 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             touch_replay_vn = true;     // Clique na aba direita da caixa de diálogo toca a última nota de voz [N]
         } else if (ty >= 158 && ty <= 176 && tx < 140) {
             touch_rpg_modal = true;     // Clique na aba esquerda ("SISTEMA ORÁCULO:") abre o painel de RPG/Hábitos
+        } else if (ty >= 30 && ty <= 64 && tx >= 68 && tx <= 252) {
+            touch_head_pat = true;      // Clique na testa / topo da cabeça faz carinho imediato (Cafuné)!
         } else {
-            touch_poke_face = true;     // Clique no rosto central dispara carinho/interação com o Oráculo
+            touch_poke_face = true;     // Clique no rosto central dispara interação com o Oráculo
+            blink_bounce_until_ms = now_ms + 240U;
+        }
+    }
+
+    if (touch_head_pat) {
+        head_pat_until_ms = now_ms + 2600U;
+        blink_bounce_until_ms = now_ms + 260U;
+        current_emotion = EMOTION_HAPPY;
+        emotion_lock_until_ms = now_ms + 3400U;
+        if (now_ms - last_head_pat_reward_ms > 2400U) {
+            last_head_pat_reward_ms = now_ms;
+            internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 4, 0, MAX_STAT_VALUE);
+            oracle_brain.addXpPoints(5);
+            playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
+            spawnHudPopup("CAFUNE! +5 XP", 118.0f, 44.0f, COLOR_CYBER_GREEN, 1800U);
         }
     }
 
@@ -603,8 +695,11 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         last_hand_wave_ms = now_ms;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 4500U;
+        blink_bounce_until_ms = now_ms + 280U;
+        wink_until_ms = now_ms + 520U;
         internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 5, 0, MAX_STAT_VALUE);
         oracle_brain.addXpPoints(5);
+        spawnHudPopup("ACENO! +5 XP", 122.0f, 44.0f, COLOR_CYBER_GREEN, 1800U);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
             static const char* const WAVE_PHRASES[] = {
@@ -622,8 +717,10 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         if (gaze_data.head_nod_yes) {
             current_emotion = EMOTION_HAPPY;
             emotion_lock_until_ms = now_ms + 4000U;
+            blink_bounce_until_ms = now_ms + 260U;
             internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 4, 0, MAX_STAT_VALUE);
             oracle_brain.addXpPoints(4);
+            spawnHudPopup("SIM! +4 XP", 128.0f, 44.0f, COLOR_CYBER_GREEN, 1700U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi() && !is_muted_indefinitely) {
                 static const char* const NOD_PHRASES[] = {
@@ -638,6 +735,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             emotion_lock_until_ms = now_ms + 4000U;
             internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 2, 0, MAX_STAT_VALUE);
             oracle_brain.addXpPoints(3);
+            spawnHudPopup("NEGATIVO! +3 XP", 116.0f, 44.0f, COLOR_CYBER_ORANGE, 1700U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi() && !is_muted_indefinitely) {
                 static const char* const SHAKE_PHRASES[] = {
@@ -656,11 +754,13 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         if (is_muted_indefinitely) {
             current_emotion = EMOTION_LISTENING;
             emotion_lock_until_ms = now_ms + 4500U;
+            spawnHudPopup("MODO SILENCIO", 120.0f, 44.0f, COLOR_CYBER_ORANGE, 1800U);
             stopSpeakingImmediately(hal_sensors, "[SILÊNCIO INDEFINIDO ATIVO — PRESSIONE [Q], [J] OU 2 PALMAS P/ SAIR]");
             M5_LOGI("[SILENCIO] Modo Silencio Indefinido ATIVADO via tecla [Q]!");
         } else {
             current_emotion = EMOTION_HAPPY;
             emotion_lock_until_ms = now_ms + 3500U;
+            spawnHudPopup("VOZ ATIVA!", 126.0f, 44.0f, COLOR_CYBER_GREEN, 1800U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             static const char* const UNMUTE_PHRASES[] = {
                 "Modo silêncio encerrado! Voz tática do Bicho reativada na bancada.",
@@ -681,8 +781,11 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         pip_display_until_ms = now_ms + 5500U;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 5000U;
+        blink_bounce_until_ms = now_ms + 280U;
+        wink_until_ms = now_ms + 560U;
         internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 8, 0, MAX_STAT_VALUE);
         oracle_brain.addXpPoints(10);
+        spawnHudPopup("JOINHA! +10 XP", 116.0f, 44.0f, COLOR_CYBER_GREEN, 2000U);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
             static const char* const THUMB_PHRASES[] = {
@@ -704,6 +807,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         pip_display_until_ms = now_ms + 5000U;
         current_emotion = EMOTION_LISTENING;
         emotion_lock_until_ms = now_ms + 4500U;
+        spawnHudPopup("PALMA: SILENCIO", 114.0f, 44.0f, COLOR_CYBER_ORANGE, 1900U);
         stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA (STOP) — SILÊNCIO INDEFINIDO ATIVO ([Q] OU 2 PALMAS P/ SAIR)]");
         M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP/SILENCIO) detectada! Modo Silencio Indefinido ativado.");
     }
@@ -716,8 +820,10 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         selfie_flash_until_ms = now_ms + 350U;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 4500U;
+        wink_until_ms = now_ms + 620U;
         internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 6, 0, MAX_STAT_VALUE);
         oracle_brain.addXpPoints(8);
+        spawnHudPopup("SELFIE! +8 XP", 118.0f, 44.0f, COLOR_CYBER_GREEN, 2000U);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_camera_scan.wav").c_str());
         oracle_brain.saveEventSnapshotToSd("GESTURE_VICTORY_SELFIE");
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
@@ -733,11 +839,13 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     // 2.8. Ouvido 2.0: Gestos Acústicos em Tempo Real (Duas Palmas 👏👏 e Assobio 🎵) — PC e CoreS3!
     if (audio_data.double_clap_detected && (now_ms - last_acoustic_gesture_ms > 4500U)) {
         last_acoustic_gesture_ms = now_ms;
+        blink_bounce_until_ms = now_ms + 260U;
         if (is_muted_indefinitely) {
             is_muted_indefinitely = false;
             current_emotion = EMOTION_HAPPY;
             emotion_lock_until_ms = now_ms + 4000U;
             oracle_brain.addXpPoints(5);
+            spawnHudPopup("2 PALMAS! +5 XP", 114.0f, 44.0f, COLOR_CYBER_GREEN, 1900U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             speakWithLipSync(hal_sensors, "Duas palmas detectadas no microfone! Modo silêncio encerrado, estou na escuta!");
         } else {
@@ -746,6 +854,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             emotion_lock_until_ms = now_ms + 3500U;
             internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 4, 0, MAX_STAT_VALUE);
             oracle_brain.addXpPoints(5);
+            spawnHudPopup("2 PALMAS! +5 XP", 114.0f, 44.0f, COLOR_CYBER_GREEN, 1900U);
             playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
             if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
                 static const char* const CLAP_PHRASES[] = {
@@ -760,8 +869,10 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         last_acoustic_gesture_ms = now_ms;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 4500U;
+        wink_until_ms = now_ms + 520U;
         internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 5, 0, MAX_STAT_VALUE);
         oracle_brain.addXpPoints(6);
+        spawnHudPopup("ASSOBIO! +6 XP", 116.0f, 44.0f, COLOR_CYBER_GREEN, 1900U);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!is_muted_indefinitely && !lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
             static const char* const WHISTLE_PHRASES[] = {
@@ -1214,6 +1325,16 @@ void PetController::applyOracleResponse(HalSensors& hal_sensors, const OracleRes
     internal_stats.energy_level = clampStatValue(internal_stats.energy_level + response_payload.energy_delta, 30, MAX_STAT_VALUE);
     internal_stats.hunger_level = clampStatValue(internal_stats.hunger_level + response_payload.hunger_delta, 0, 80);
     buildStateJson(last_state_json, sizeof(last_state_json));
+
+    if (response_payload.hunger_delta < 0) {
+        char feed_buf[28];
+        std::snprintf(feed_buf, sizeof(feed_buf), "RECARGA %d FOME!", static_cast<int>(response_payload.hunger_delta));
+        spawnHudPopup(feed_buf, 110.0f, 44.0f, COLOR_CYBER_GREEN, 2100U);
+    } else if (safe_mood_delta > 0) {
+        char mood_buf[28];
+        std::snprintf(mood_buf, sizeof(mood_buf), "HUMOR +%d%%", static_cast<int>(safe_mood_delta));
+        spawnHudPopup(mood_buf, 126.0f, 44.0f, getActiveOpticPrimaryColor(), 1700U);
+    }
 
     // Salva evolução e humor do bicho após cada interação com o Oráculo
     syncPersistentState(hal_sensors);
@@ -2423,6 +2544,15 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
     // Alvo do rastreamento ocular normalizado [-1.0, 1.0] + micro-saccades e inclinação da cabeça (head roll)
     target_pose.current_eye_x = (gaze_data.target_x * FACE_GAZE_MAX_X) + saccade_offset_x;
     target_pose.current_eye_y = (gaze_data.target_y * FACE_GAZE_MAX_Y) + saccade_offset_y;
+
+    // Reatividade em tempo real à digitação: olhos varrem horizontalmente como se estivessem lendo o código!
+    if (cached_audio_data.is_typing_cadence && current_emotion != EMOTION_SLEEPING && current_emotion != EMOTION_STARTLED) {
+        float scan_phase = std::fmod(static_cast<float>(now_ms) * 0.0032f, 1.0f);
+        float read_sweep_x = (scan_phase * 2.0f - 1.0f) * 10.5f; // Varre da esquerda para a direita e salta de volta (carriage return)
+        target_pose.current_eye_x = (target_pose.current_eye_x * 0.35f) + read_sweep_x;
+        target_pose.current_eye_y = (target_pose.current_eye_y * 0.45f) + 3.5f;
+    }
+
     target_pose.eye_offset_x = target_pose.current_eye_x;
     target_pose.eye_offset_y = target_pose.current_eye_y;
 
@@ -2431,129 +2561,167 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
     if (clamped_tilt > 25.0f)  clamped_tilt = 25.0f;
     target_pose.head_tilt_deg = gaze_data.face_detected ? clamped_tilt : 0.0f;
 
-    // 2. Controle de piscada natural aleatória
+    // Respiração / Flutuação Orgânica contínua (mais lenta dormindo, mais viva acordado)
+    float breath_speed = (current_emotion == EMOTION_SLEEPING || current_emotion == EMOTION_SLEEPY) ? 0.0018f : 0.0034f;
+    float breath_amp   = (current_emotion == EMOTION_SLEEPING || current_emotion == EMOTION_SLEEPY) ? 2.4f : 1.6f;
+    target_pose.breathing_offset_y = std::sin(static_cast<float>(now_ms) * breath_speed) * breath_amp;
+
+    // 2. Controle de piscada natural aleatória + squash & stretch pós-piscada + piscadinha cúmplice (wink)
     if (!is_blinking && (now_ms - last_blink_ms > next_blink_interval_ms)) {
         is_blinking = true;
         last_blink_ms = now_ms;
     } else if (is_blinking && (now_ms - last_blink_ms > 125)) {
         is_blinking = false;
         last_blink_ms = now_ms;
+        blink_bounce_until_ms = now_ms + 130U;
         next_blink_interval_ms = 2400 + ((now_ms * 17) % 2600);
+    }
+
+    // Piscadinha espontânea de cumplicidade quando o usuário sorri ou o humor está alto
+    if (now_ms >= next_wink_ms) {
+        if ((gaze_data.face_detected && gaze_data.is_smiling) ||
+            (current_emotion == EMOTION_HAPPY && internal_stats.mood_score >= 75)) {
+            wink_until_ms = now_ms + 420U;
+        }
+        next_wink_ms = now_ms + 9500U + ((now_ms * 29U) % 8500U);
     }
 
     // 3. Configuração padrão da pose + Dilatação Reativa da Pupila (dilata ao falar/ouvir/sorrir, contrai em foco profundo)
     float pupil_react = 0.0f;
-    if (lip_sync_state.is_speaking || current_emotion == EMOTION_LISTENING || gaze_data.is_smiling) {
-        pupil_react = 1.5f;
-    } else if (pomodoro_active || current_emotion == EMOTION_FOCUSED) {
+    if (lip_sync_state.is_speaking || current_emotion == EMOTION_LISTENING || gaze_data.is_smiling || (now_ms < head_pat_until_ms)) {
+        pupil_react = 1.8f;
+    } else if (pomodoro_active || current_emotion == EMOTION_FOCUSED || cached_audio_data.is_typing_cadence) {
         pupil_react = -1.0f;
     }
 
     target_pose.eye_radius_current = FACE_EYE_DEFAULT_R;
+    target_pose.eye_scale_x = 1.0f;
+    target_pose.eye_scale_y = 1.0f;
     target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R + pupil_react;
-    target_pose.upper_eyelid_closure = 0.0f;  // Olhos totalmente abertos por padrão (sem corte reto de "olhar bravo")
+    target_pose.upper_eyelid_closure = 0.0f;  // Olhos totalmente abertos por padrão
     target_pose.lower_eyelid_closure = 0.16f; // Curvatura inferior sorridente e simpática
     target_pose.eyebrow_angle_deg = -5.0f;    // Sobrancelhas levemente erguidas no centro (/ \), expressão amigável
     target_pose.eyebrow_offset_y = -2.5f;
     target_pose.mouth_width_current = 18.0f;
-    target_pose.mouth_curve_factor = 0.48f;   // Sorriso claro de companheiro de bancada
+    target_pose.mouth_curve_factor = 0.52f;   // Sorriso claro de companheiro de bancada
+    target_pose.cheek_glow_intensity = (gaze_data.face_detected && gaze_data.is_smiling) ? 0.65f : 0.0f;
     target_pose.shake_offset_x = 0.0f;
     target_pose.shake_offset_y = 0.0f;
 
     switch (current_emotion) {
         case EMOTION_STARTLED:
-            // Pupilas e olhos dilatam no susto + tremor intenso na tela
+            // Pupilas e olhos esticam verticalmente no susto (Squash & Stretch) + tremor intenso
             target_pose.eye_radius_current = FACE_EYE_DEFAULT_R + 3.0f;
-            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R + 3.5f;
+            target_pose.eye_scale_x = 0.90f;
+            target_pose.eye_scale_y = 1.18f;
+            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 2.5f; // Pupila contrai em choque!
             target_pose.upper_eyelid_closure = 0.0f;
             target_pose.lower_eyelid_closure = 0.0f;
-            target_pose.eyebrow_offset_y = -6.0f;
-            target_pose.eyebrow_angle_deg = -14.0f;
+            target_pose.eyebrow_offset_y = -6.5f;
+            target_pose.eyebrow_angle_deg = -15.0f;
             target_pose.mouth_width_current = 20.0f;
-            target_pose.mouth_curve_factor = -0.55f;
+            target_pose.mouth_curve_factor = -0.68f;
             target_pose.shake_offset_x = (now_ms % 2 == 0) ? 4.5f : -4.5f;
             target_pose.shake_offset_y = ((now_ms / 2) % 2 == 0) ? 3.0f : -3.0f;
             break;
 
         case EMOTION_JUDGING:
-            // Expressão irônica/marota estilo JARVIS: olho aberto, uma sobrancelha arqueada lá no alto e sorriso de canto!
-            target_pose.upper_eyelid_closure = 0.04f;
-            target_pose.lower_eyelid_closure = 0.22f;
+            // Expressão irônica/marota estilo JARVIS: olho semi-cerrado desconfiado, sobrancelha direita arqueada lá no alto e smirk!
+            target_pose.eye_scale_x = 1.05f;
+            target_pose.eye_scale_y = 0.94f;
+            target_pose.upper_eyelid_closure = 0.14f;
+            target_pose.lower_eyelid_closure = 0.24f;
             target_pose.eyebrow_angle_deg = -4.0f;
             target_pose.eyebrow_offset_y = -2.0f;
             target_pose.mouth_width_current = 19.0f;
-            target_pose.mouth_curve_factor = 0.42f;
+            target_pose.mouth_curve_factor = 0.46f;
             break;
 
         case EMOTION_GRUMPY:
             // Sobrancelhas franzidas em V (reservado APENAS quando estiver realmente faminto > 90 ou humor < 15)
-            target_pose.upper_eyelid_closure = 0.28f;
-            target_pose.lower_eyelid_closure = 0.0f;
-            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.0f;
-            target_pose.eyebrow_angle_deg = 14.0f;
-            target_pose.eyebrow_offset_y = 2.5f;
+            target_pose.eye_scale_x = 1.06f;
+            target_pose.eye_scale_y = 0.90f;
+            target_pose.upper_eyelid_closure = 0.32f;
+            target_pose.lower_eyelid_closure = 0.08f;
+            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.5f;
+            target_pose.eyebrow_angle_deg = 15.0f;
+            target_pose.eyebrow_offset_y = 3.0f;
             target_pose.mouth_width_current = 18.0f;
-            target_pose.mouth_curve_factor = -0.50f;
-            target_pose.shake_offset_x = (now_ms % 6 == 0) ? 1.0f : 0.0f;
+            target_pose.mouth_curve_factor = -0.62f;
+            target_pose.shake_offset_x = (now_ms % 6 == 0) ? 1.2f : 0.0f;
             break;
 
         case EMOTION_FOCUSED:
-            // Olhar atento, vivo e amigável de parceiro de programação (zero cara de bravo!)
+            // Olhar atento, vivo e amigável de parceiro de programação
+            target_pose.eye_scale_x = 1.03f;
+            target_pose.eye_scale_y = 0.97f;
             target_pose.upper_eyelid_closure = 0.0f;
             target_pose.lower_eyelid_closure = 0.18f;
             target_pose.eyebrow_angle_deg = -4.0f;
             target_pose.eyebrow_offset_y = -2.0f;
             target_pose.mouth_width_current = 18.0f;
-            target_pose.mouth_curve_factor = 0.38f;
+            target_pose.mouth_curve_factor = 0.42f;
             break;
 
         case EMOTION_HAPPY:
-            // Pálpebra inferior sobe em arco formando olhos sorridentes (^ ^) e sobrancelhas altas relaxadas
+            // Pálpebra inferior sobe em arco formando olhos sorridentes (^ ^), bochechas acesas e sorriso largo
+            target_pose.eye_scale_x = 1.08f;
+            target_pose.eye_scale_y = 0.93f;
             target_pose.upper_eyelid_closure = 0.0f;
-            target_pose.lower_eyelid_closure = 0.44f;
-            target_pose.eyebrow_offset_y = -4.5f;
-            target_pose.eyebrow_angle_deg = -8.0f;
+            target_pose.lower_eyelid_closure = 0.48f;
+            target_pose.eyebrow_offset_y = -5.0f;
+            target_pose.eyebrow_angle_deg = -9.0f;
             target_pose.mouth_width_current = 22.0f;
-            target_pose.mouth_curve_factor = 0.92f;
+            target_pose.mouth_curve_factor = 0.96f;
+            target_pose.cheek_glow_intensity = 0.92f;
             break;
 
         case EMOTION_LISTENING:
-            // Olhos bem abertos e curiosos prestando atenção na voz do usuário
+            // Olhos bem abertos e curiosos prestando atenção na voz do usuário + leve inclinação curiosa
+            target_pose.eye_scale_x = 1.04f;
+            target_pose.eye_scale_y = 1.08f;
             target_pose.upper_eyelid_closure = 0.0f;
-            target_pose.lower_eyelid_closure = 0.18f;
-            target_pose.eyebrow_angle_deg = -6.0f;
-            target_pose.eyebrow_offset_y = -3.0f;
+            target_pose.lower_eyelid_closure = 0.20f;
+            target_pose.eyebrow_angle_deg = -7.0f;
+            target_pose.eyebrow_offset_y = -3.5f;
             target_pose.mouth_width_current = 18.0f;
-            target_pose.mouth_curve_factor = 0.45f;
+            target_pose.mouth_curve_factor = 0.52f;
+            target_pose.head_tilt_deg += 4.5f;
             break;
 
         case EMOTION_SLEEPY:
             // Bocejando / quase dormindo
-            target_pose.upper_eyelid_closure = 0.62f;
+            target_pose.eye_scale_x = 1.04f;
+            target_pose.eye_scale_y = 0.88f;
+            target_pose.upper_eyelid_closure = 0.64f;
             target_pose.lower_eyelid_closure = 0.0f;
             target_pose.eyebrow_angle_deg = -4.0f;
             target_pose.eyebrow_offset_y = 3.0f;
             target_pose.mouth_curve_factor = 0.0f;
             if (!lip_sync_state.is_speaking) {
-                target_pose.mouth_open_height = 10.0f;
+                target_pose.mouth_open_height = 11.0f;
                 target_pose.mouth_width_current = 16.0f;
             }
             break;
 
         case EMOTION_SLEEPING:
             // Olhos totalmente fechados e respiração lenta tranquila
-            target_pose.upper_eyelid_closure = 0.92f;
+            target_pose.eye_scale_x = 1.06f;
+            target_pose.eye_scale_y = 0.84f;
+            target_pose.upper_eyelid_closure = 0.94f;
             target_pose.lower_eyelid_closure = 0.0f;
             target_pose.eyebrow_angle_deg = -2.0f;
             target_pose.eyebrow_offset_y = 4.0f;
             target_pose.mouth_width_current = 14.0f;
-            target_pose.mouth_curve_factor = 0.25f;
+            target_pose.mouth_curve_factor = 0.28f;
             break;
 
         case EMOTION_DIZZY:
-            // Sobrecarga / tontura com oscilação orbital das pupilas e tremor
+            // Sobrecarga / tontura com oscilação orbital das pupilas, espirais e olhos assimétricos
             target_pose.eye_radius_current = FACE_EYE_DEFAULT_R + 2.0f;
-            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 2.0f;
+            target_pose.eye_scale_x = 1.0f + std::sin(static_cast<float>(now_ms) * 0.018f) * 0.12f;
+            target_pose.eye_scale_y = 1.0f + std::cos(static_cast<float>(now_ms) * 0.018f) * 0.12f;
+            target_pose.pupil_radius_current = FACE_PUPIL_DEFAULT_R - 1.5f;
             target_pose.upper_eyelid_closure = 0.15f;
             target_pose.eyebrow_angle_deg = -14.0f;
             target_pose.eyebrow_offset_y = -2.0f;
@@ -2570,20 +2738,83 @@ void PetController::computeTargetFacePose(const GazeTargetData& gaze_data, uint3
             target_pose.lower_eyelid_closure = 0.16f;
             target_pose.eyebrow_angle_deg = -5.0f;
             target_pose.eyebrow_offset_y = -2.5f;
-            target_pose.mouth_curve_factor = 0.48f;
+            target_pose.mouth_curve_factor = 0.52f;
             break;
     }
 
-    // Ouvido 2.0: Se detectar batida rítmica/música no ambiente (PC ou CoreS3), o Bicho balança as sobrancelhas e a cabeça no ritmo!
-    if (cached_audio_data.music_beat_active && !lip_sync_state.is_speaking && current_emotion != EMOTION_SLEEPY) {
-        float beat_wave = std::sin(cached_audio_data.music_beat_phase * 6.2831853f);
-        target_pose.eyebrow_offset_y += beat_wave * 2.5f;
-        target_pose.head_tilt_deg += beat_wave * 3.2f;
-        target_pose.mouth_curve_factor = std::fmax(target_pose.mouth_curve_factor, 0.72f);
+    // Reação imediata ao Cafuné / Carinho na cabeça: fecha os olhos em arco feliz (^ ^), inclina a cabeça e acende as bochechas!
+    if (now_ms < head_pat_until_ms) {
+        target_pose.eye_scale_x = 1.12f;
+        target_pose.eye_scale_y = 0.88f;
+        target_pose.upper_eyelid_closure = 0.0f;
+        target_pose.lower_eyelid_closure = 0.62f;
+        target_pose.eyebrow_offset_y = -5.5f;
+        target_pose.eyebrow_angle_deg = -10.0f;
+        target_pose.mouth_curve_factor = 1.0f;
+        target_pose.cheek_glow_intensity = 1.0f;
+        target_pose.head_tilt_deg = std::sin(static_cast<float>(now_ms) * 0.012f) * 8.5f;
     }
 
+    // Ouvido 2.0: Se detectar batida rítmica/música no ambiente (PC ou CoreS3), o Bicho dança e pulsa as lentes no BPM!
+    if (cached_audio_data.music_beat_active && !lip_sync_state.is_speaking && current_emotion != EMOTION_SLEEPY) {
+        float beat_wave = std::sin(cached_audio_data.music_beat_phase * 6.2831853f);
+        float beat_pulse = std::fabs(beat_wave);
+        target_pose.eyebrow_offset_y += beat_wave * 3.0f;
+        target_pose.head_tilt_deg += beat_wave * 4.8f;
+        target_pose.eye_scale_x += beat_pulse * 0.08f;
+        target_pose.eye_scale_y += beat_pulse * 0.08f;
+        target_pose.mouth_curve_factor = std::fmax(target_pose.mouth_curve_factor, 0.82f);
+        target_pose.cheek_glow_intensity = std::fmax(target_pose.cheek_glow_intensity, 0.55f);
+    }
+
+    // Squash & Stretch das pálpebras e lentes durante e logo após a piscada (estilo animação Disney/Cozmo)
     if (is_blinking) {
-        target_pose.upper_eyelid_closure = 0.95f;
+        target_pose.upper_eyelid_closure = 0.96f;
+        target_pose.eye_scale_x = 1.14f;
+        target_pose.eye_scale_y = 0.78f;
+    } else if (now_ms < blink_bounce_until_ms) {
+        target_pose.eye_scale_x = 0.94f;
+        target_pose.eye_scale_y = 1.09f;
+    }
+
+    // Inicializa controles independentes esquerdo/direito a partir da base simétrica e aplica assimetrias expressivas
+    target_pose.left_upper_lid        = target_pose.upper_eyelid_closure;
+    target_pose.right_upper_lid       = target_pose.upper_eyelid_closure;
+    target_pose.left_lower_lid        = target_pose.lower_eyelid_closure;
+    target_pose.right_lower_lid       = target_pose.lower_eyelid_closure;
+    target_pose.left_brow_angle_deg   = target_pose.eyebrow_angle_deg;
+    target_pose.right_brow_angle_deg  = -target_pose.eyebrow_angle_deg;
+    target_pose.left_brow_offset_y    = target_pose.eyebrow_offset_y;
+    target_pose.right_brow_offset_y   = target_pose.eyebrow_offset_y;
+
+    if (current_emotion == EMOTION_JUDGING) {
+        // Olho esquerdo semi-cerrado analisando e olho direito bem aberto com sobrancelha arqueada lá no alto!
+        target_pose.left_upper_lid       = std::fmax(target_pose.left_upper_lid, 0.28f);
+        target_pose.right_upper_lid      = 0.0f;
+        target_pose.right_lower_lid      = 0.26f;
+        target_pose.left_brow_angle_deg  = -2.0f;
+        target_pose.right_brow_angle_deg = 11.0f;
+        target_pose.left_brow_offset_y   = -1.0f;
+        target_pose.right_brow_offset_y  = -7.5f;
+    } else if (current_emotion == EMOTION_LISTENING || cached_audio_data.is_typing_cadence) {
+        // Leve assimetria curiosa nas sobrancelhas quando escutando ou lendo código
+        target_pose.right_brow_offset_y -= 2.5f;
+        target_pose.right_brow_angle_deg += 4.5f;
+    } else if (current_emotion == EMOTION_DIZZY) {
+        // Pálpebras e sobrancelhas desalinhadas em curto-circuito
+        target_pose.left_upper_lid       = 0.32f;
+        target_pose.right_upper_lid      = 0.04f;
+        target_pose.left_brow_offset_y   = 2.0f;
+        target_pose.right_brow_offset_y  = -5.0f;
+    }
+
+    // Piscadinha de um olho só (Wink no olho direito!) quando ativada por sorriso/cumplicidade
+    if (now_ms < wink_until_ms && !is_blinking && current_emotion != EMOTION_SLEEPING) {
+        target_pose.right_upper_lid      = 0.88f;
+        target_pose.right_lower_lid      = 0.45f;
+        target_pose.right_brow_offset_y += 2.5f;
+        target_pose.mouth_curve_factor   = std::fmax(target_pose.mouth_curve_factor, 0.85f);
+        target_pose.cheek_glow_intensity = std::fmax(target_pose.cheek_glow_intensity, 0.75f);
     }
 }
 
@@ -2596,16 +2827,28 @@ void PetController::interpolateFacePose() {
     current_pose.current_eye_y        = lerp_val(current_pose.current_eye_y, target_pose.current_eye_y, FACE_EASING_SPEED);
     current_pose.eye_offset_x         = current_pose.current_eye_x;
     current_pose.eye_offset_y         = current_pose.current_eye_y;
-    current_pose.eye_radius_current   = lerp_val(current_pose.eye_radius_current, target_pose.eye_radius_current, 0.22f);
-    current_pose.pupil_radius_current = lerp_val(current_pose.pupil_radius_current, target_pose.pupil_radius_current, 0.25f);
-    current_pose.upper_eyelid_closure = lerp_val(current_pose.upper_eyelid_closure, target_pose.upper_eyelid_closure, 0.30f);
-    current_pose.lower_eyelid_closure = lerp_val(current_pose.lower_eyelid_closure, target_pose.lower_eyelid_closure, 0.25f);
-    current_pose.eyebrow_angle_deg    = lerp_val(current_pose.eyebrow_angle_deg, target_pose.eyebrow_angle_deg, 0.20f);
-    current_pose.eyebrow_offset_y     = lerp_val(current_pose.eyebrow_offset_y, target_pose.eyebrow_offset_y, 0.20f);
-    current_pose.head_tilt_deg        = lerp_val(current_pose.head_tilt_deg, target_pose.head_tilt_deg, 0.22f);
-    current_pose.mouth_open_height    = lerp_val(current_pose.mouth_open_height, target_pose.mouth_open_height, 0.42f);
-    current_pose.mouth_width_current  = lerp_val(current_pose.mouth_width_current, target_pose.mouth_width_current, 0.22f);
-    current_pose.mouth_curve_factor   = lerp_val(current_pose.mouth_curve_factor, target_pose.mouth_curve_factor, 0.20f);
+    current_pose.eye_radius_current   = lerp_val(current_pose.eye_radius_current, target_pose.eye_radius_current, 0.24f);
+    current_pose.eye_scale_x          = lerp_val(current_pose.eye_scale_x, target_pose.eye_scale_x, 0.32f);
+    current_pose.eye_scale_y          = lerp_val(current_pose.eye_scale_y, target_pose.eye_scale_y, 0.32f);
+    current_pose.pupil_radius_current = lerp_val(current_pose.pupil_radius_current, target_pose.pupil_radius_current, 0.28f);
+    current_pose.upper_eyelid_closure = lerp_val(current_pose.upper_eyelid_closure, target_pose.upper_eyelid_closure, 0.34f);
+    current_pose.lower_eyelid_closure = lerp_val(current_pose.lower_eyelid_closure, target_pose.lower_eyelid_closure, 0.28f);
+    current_pose.left_upper_lid       = lerp_val(current_pose.left_upper_lid, target_pose.left_upper_lid, 0.34f);
+    current_pose.right_upper_lid      = lerp_val(current_pose.right_upper_lid, target_pose.right_upper_lid, 0.34f);
+    current_pose.left_lower_lid       = lerp_val(current_pose.left_lower_lid, target_pose.left_lower_lid, 0.28f);
+    current_pose.right_lower_lid      = lerp_val(current_pose.right_lower_lid, target_pose.right_lower_lid, 0.28f);
+    current_pose.eyebrow_angle_deg    = lerp_val(current_pose.eyebrow_angle_deg, target_pose.eyebrow_angle_deg, 0.24f);
+    current_pose.eyebrow_offset_y     = lerp_val(current_pose.eyebrow_offset_y, target_pose.eyebrow_offset_y, 0.24f);
+    current_pose.left_brow_angle_deg  = lerp_val(current_pose.left_brow_angle_deg, target_pose.left_brow_angle_deg, 0.24f);
+    current_pose.right_brow_angle_deg = lerp_val(current_pose.right_brow_angle_deg, target_pose.right_brow_angle_deg, 0.24f);
+    current_pose.left_brow_offset_y   = lerp_val(current_pose.left_brow_offset_y, target_pose.left_brow_offset_y, 0.24f);
+    current_pose.right_brow_offset_y  = lerp_val(current_pose.right_brow_offset_y, target_pose.right_brow_offset_y, 0.24f);
+    current_pose.head_tilt_deg        = lerp_val(current_pose.head_tilt_deg, target_pose.head_tilt_deg, 0.24f);
+    current_pose.breathing_offset_y   = lerp_val(current_pose.breathing_offset_y, target_pose.breathing_offset_y, 0.25f);
+    current_pose.cheek_glow_intensity = lerp_val(current_pose.cheek_glow_intensity, target_pose.cheek_glow_intensity, 0.22f);
+    current_pose.mouth_open_height    = lerp_val(current_pose.mouth_open_height, target_pose.mouth_open_height, 0.44f);
+    current_pose.mouth_width_current  = lerp_val(current_pose.mouth_width_current, target_pose.mouth_width_current, 0.25f);
+    current_pose.mouth_curve_factor   = lerp_val(current_pose.mouth_curve_factor, target_pose.mouth_curve_factor, 0.24f);
     current_pose.shake_offset_x       = target_pose.shake_offset_x;
     current_pose.shake_offset_y       = target_pose.shake_offset_y;
 }
@@ -2824,19 +3067,24 @@ void PetController::renderCombatOpticEye(
     bool is_left_eye,
     uint32_t now_ms
 ) {
-    float scale_factor = current_pose.eye_radius_current / FACE_EYE_DEFAULT_R;
-    int32_t rx = static_cast<int32_t>(FACE_EYE_RX_DEFAULT * scale_factor); // ~26px
-    int32_t ry = static_cast<int32_t>(FACE_EYE_RY_DEFAULT * scale_factor); // ~23px
+    float base_scale = current_pose.eye_radius_current / FACE_EYE_DEFAULT_R;
+    float scale_x = base_scale * current_pose.eye_scale_x;
+    float scale_y = base_scale * current_pose.eye_scale_y;
+    int32_t rx = static_cast<int32_t>(std::round(FACE_EYE_RX_DEFAULT * scale_x)); // ~26px modulável
+    int32_t ry = static_cast<int32_t>(std::round(FACE_EYE_RY_DEFAULT * scale_y)); // ~23px modulável
+    if (rx < 8) rx = 8;
+    if (ry < 6) ry = 6;
 
     uint8_t color_idx = getActiveOpticColorIndex();
     uint16_t optic_primary = getActiveOpticPrimaryColor();
     uint16_t optic_core = getActiveOpticCoreColor();
 
     // 1. Medidores Orbitais Segmentados girando suavemente em torno das órbitas oculares em paleta harmônica
-    int32_t orb_r = rx + 6;
+    int32_t orb_r = ((rx > ry) ? rx : ry) + 6;
     canvas.drawCircle(center_x, center_y, orb_r, COLOR_CYBER_GRID_BLUE);
 
-    float base_spin = static_cast<float>(now_ms) * (is_left_eye ? 0.0020f : -0.0020f);
+    float spin_speed = (current_emotion == EMOTION_STARTLED || current_emotion == EMOTION_DIZZY) ? 0.0065f : 0.0020f;
+    float base_spin = static_cast<float>(now_ms) * (is_left_eye ? spin_speed : -spin_speed);
     for (int seg = 0; seg < 4; ++seg) {
         float a0 = base_spin + static_cast<float>(seg) * 1.570796f;
         for (int step = 0; step < 6; ++step) {
@@ -2848,9 +3096,9 @@ void PetController::renderCombatOpticEye(
         }
     }
 
-    // 2. Renderiza a Textura 16-bit 64x64 HD da Lente Óptica do Cartão SD (com malha favo de mel + reflexo de vidro 3D)
+    // 2. Renderiza a Textura 16-bit 64x64 HD da Lente Óptica do Cartão SD com suporte a Squash & Stretch (scale_x / scale_y)
     const uint16_t* lens_tex = eye_lens_textures_rgb565[color_idx % EYE_LENS_COLOR_COUNT];
-    if (std::fabs(scale_factor - 1.0f) < 0.06f) {
+    if (std::fabs(scale_x - 1.0f) < 0.05f && std::fabs(scale_y - 1.0f) < 0.05f) {
         canvas.pushImage(
             center_x - (EYE_LENS_TEX_SIZE / 2),
             center_y - (EYE_LENS_TEX_SIZE / 2),
@@ -2860,15 +3108,16 @@ void PetController::renderCombatOpticEye(
             COLOR_KEY_TRANSPARENT
         );
     } else {
-        // Amostragem proporcional da textura 64x64 quando o olho está escalonado (ex.: PIP ativo ou susto)
-        int32_t half_draw = static_cast<int32_t>(std::round(32.0f * scale_factor));
-        if (half_draw < 8) half_draw = 8;
-        for (int32_t dy = -half_draw; dy < half_draw; ++dy) {
-            int32_t sy = ((dy + half_draw) * EYE_LENS_TEX_SIZE) / (half_draw * 2);
+        int32_t half_w = static_cast<int32_t>(std::round(32.0f * scale_x));
+        int32_t half_h = static_cast<int32_t>(std::round(32.0f * scale_y));
+        if (half_w < 8) half_w = 8;
+        if (half_h < 6) half_h = 6;
+        for (int32_t dy = -half_h; dy < half_h; ++dy) {
+            int32_t sy = ((dy + half_h) * EYE_LENS_TEX_SIZE) / (half_h * 2);
             if (sy < 0) sy = 0;
             if (sy >= EYE_LENS_TEX_SIZE) sy = EYE_LENS_TEX_SIZE - 1;
-            for (int32_t dx = -half_draw; dx < half_draw; ++dx) {
-                int32_t sx = ((dx + half_draw) * EYE_LENS_TEX_SIZE) / (half_draw * 2);
+            for (int32_t dx = -half_w; dx < half_w; ++dx) {
+                int32_t sx = ((dx + half_w) * EYE_LENS_TEX_SIZE) / (half_w * 2);
                 if (sx < 0) sx = 0;
                 if (sx >= EYE_LENS_TEX_SIZE) sx = EYE_LENS_TEX_SIZE - 1;
                 uint16_t px_col = lens_tex[sy * EYE_LENS_TEX_SIZE + sx];
@@ -2879,31 +3128,68 @@ void PetController::renderCombatOpticEye(
         }
     }
 
-    // 3. Pupilas com Padrão de Dados (Retículo de Mira / Target Lock) reagindo a current_eye_x e current_eye_y
+    // 3. Pupilas Expressivas: Retículo de Mira padrão ou símbolos especiais (Arco Feliz ^ ^, Espiral @ @, Exclamação !)
     int32_t reticle_x = center_x + pupil_dx;
     int32_t reticle_y = center_y + pupil_dy;
     int32_t pup_r = static_cast<int32_t>(current_pose.pupil_radius_current);
+    bool is_winking_this_eye = (!is_left_eye && (now_ms < wink_until_ms) && !is_blinking);
+    bool happy_arch_mode = (now_ms < head_pat_until_ms) || is_winking_this_eye ||
+                           (current_emotion == EMOTION_HAPPY && current_pose.lower_eyelid_closure > 0.36f);
 
-    // Câmara escura interna do sensor óptico e anéis concêntricos na cor emocional ativa
-    canvas.fillCircle(reticle_x, reticle_y, pup_r + 3, optic_core);
-    canvas.drawCircle(reticle_x, reticle_y, pup_r + 3, optic_primary);
-    canvas.drawCircle(reticle_x, reticle_y, pup_r, TFT_WHITE);
+    if (current_emotion == EMOTION_DIZZY) {
+        // Pupila em espiral giratória (@ @) durante sobrecarga ou tontura
+        canvas.fillCircle(reticle_x, reticle_y, pup_r + 3, optic_core);
+        float sp_base = static_cast<float>(now_ms) * (is_left_eye ? 0.015f : -0.015f);
+        int32_t prev_sx = reticle_x;
+        int32_t prev_sy = reticle_y;
+        for (int step = 1; step <= 20; ++step) {
+            float t = static_cast<float>(step) * 0.45f;
+            float r_sp = (static_cast<float>(step) / 20.0f) * static_cast<float>(pup_r + 3);
+            int32_t sx = reticle_x + static_cast<int32_t>(std::round(std::cos(sp_base + t) * r_sp));
+            int32_t sy = reticle_y + static_cast<int32_t>(std::round(std::sin(sp_base + t) * r_sp));
+            canvas.drawLine(prev_sx, prev_sy, sx, sy, (step % 2 == 0) ? TFT_WHITE : optic_primary);
+            prev_sx = sx;
+            prev_sy = sy;
+        }
+    } else if (happy_arch_mode) {
+        // Brilho interno de arco feliz luminoso (^ ^) estilo Cozmo/Vector quando recebe cafuné, pisca um olho ou está radiante!
+        canvas.fillCircle(reticle_x, reticle_y, pup_r + 2, optic_core);
+        for (int32_t dx = -pup_r - 2; dx <= pup_r + 2; ++dx) {
+            float nx = static_cast<float>(dx) / static_cast<float>(pup_r + 2);
+            int32_t arch_y = reticle_y - static_cast<int32_t>(std::round((1.0f - nx * nx) * 5.0f)) + 2;
+            canvas.fillRect(reticle_x + dx, arch_y - 1, 1, 3, TFT_WHITE);
+            canvas.drawPixel(reticle_x + dx, arch_y - 2, optic_primary);
+        }
+        // Brilho estrelado de alegria no canto superior da lente
+        int32_t gl_x = reticle_x - pup_r;
+        int32_t gl_y = reticle_y - pup_r;
+        canvas.drawFastHLine(gl_x - 2, gl_y, 5, TFT_WHITE);
+        canvas.drawFastVLine(gl_x, gl_y - 2, 5, TFT_WHITE);
+    } else {
+        // Câmara escura interna do sensor óptico e anéis concêntricos na cor emocional ativa
+        canvas.fillCircle(reticle_x, reticle_y, pup_r + 3, optic_core);
+        canvas.drawCircle(reticle_x, reticle_y, pup_r + 3, optic_primary);
+        canvas.drawCircle(reticle_x, reticle_y, pup_r, TFT_WHITE);
 
-    // Ticks cruzados do retículo da pupila (Crosshair) em azul-gelo harmônico
-    canvas.drawFastHLine(reticle_x - pup_r - 5, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
-    canvas.drawFastHLine(reticle_x + pup_r + 2, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
-    canvas.drawFastVLine(reticle_x, reticle_y - pup_r - 5, 4, COLOR_CYBER_ICE_LIGHT);
-    canvas.drawFastVLine(reticle_x, reticle_y + pup_r + 2, 4, COLOR_CYBER_ICE_LIGHT);
+        // Ticks cruzados do retículo da pupila (Crosshair) em azul-gelo harmônico
+        canvas.drawFastHLine(reticle_x - pup_r - 5, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
+        canvas.drawFastHLine(reticle_x + pup_r + 2, reticle_y, 4, COLOR_CYBER_ICE_LIGHT);
+        canvas.drawFastVLine(reticle_x, reticle_y - pup_r - 5, 4, COLOR_CYBER_ICE_LIGHT);
+        canvas.drawFastVLine(reticle_x, reticle_y + pup_r + 2, 4, COLOR_CYBER_ICE_LIGHT);
 
-    // Núcleo laser brilhante + segundo ponto de brilho especular na pupila (dá vida e simpatia ao olhar!)
-    canvas.fillRect(reticle_x - 1, reticle_y - 1, 3, 3, TFT_WHITE);
-    canvas.fillCircle(reticle_x - (pup_r / 2) - 1, reticle_y - (pup_r / 2) - 1, 2, TFT_WHITE);
-    canvas.drawPixel(reticle_x, reticle_y, optic_primary);
+        // Núcleo laser brilhante + segundo ponto de brilho especular dinâmico na pupila (dá vida e simpatia ao olhar!)
+        canvas.fillRect(reticle_x - 1, reticle_y - 1, 3, 3, TFT_WHITE);
+        int32_t catchlight_x = reticle_x - (pup_r / 2) - 1;
+        int32_t catchlight_y = reticle_y - (pup_r / 2) - 1;
+        canvas.fillCircle(catchlight_x, catchlight_y, 2, TFT_WHITE);
+        canvas.drawPixel(reticle_x + (pup_r / 2), reticle_y + (pup_r / 2), COLOR_CYBER_ICE_LIGHT);
+        canvas.drawPixel(reticle_x, reticle_y, optic_primary);
+    }
 
-    // 4. Obturador Mecânico Superior (apenas durante piscada, sono ou quando realmente ranzinza)
-    float closure = current_pose.upper_eyelid_closure;
-    if (closure > 0.03f) {
-        int32_t lid_cut_y = (center_y - ry) + static_cast<int32_t>((ry * 1.85f) * closure);
+    // 4. Obturador Mecânico Superior Independente por Olho (permite piscadinha de um olho só e olhar analítico!)
+    float upper_closure = is_left_eye ? current_pose.left_upper_lid : current_pose.right_upper_lid;
+    if (upper_closure > 0.03f) {
+        int32_t lid_cut_y = (center_y - ry) + static_cast<int32_t>((ry * 1.85f) * upper_closure);
         if (lid_cut_y > center_y - ry) {
             for (int32_t y = center_y - ry; y <= lid_cut_y; ++y) {
                 int32_t abs_dy = std::abs(y - center_y);
@@ -2919,12 +3205,13 @@ void PetController::renderCombatOpticEye(
         }
     }
 
-    // Obturador mecânico inferior em arco sorridente quando feliz ou bem-humorado (olhos sorridentes estilo Cozmo/Vector)
-    if (current_pose.lower_eyelid_closure > 0.05f) {
-        int32_t base_lower_h = static_cast<int32_t>(ry * current_pose.lower_eyelid_closure);
+    // 5. Obturador Mecânico Inferior em Arco Sorridente Independente por Olho (olhos sorridentes estilo Cozmo/Vector)
+    float lower_closure = is_left_eye ? current_pose.left_lower_lid : current_pose.right_lower_lid;
+    if (lower_closure > 0.05f) {
+        int32_t base_lower_h = static_cast<int32_t>(ry * lower_closure);
         for (int32_t dx = -rx; dx <= rx; ++dx) {
             float norm_x = static_cast<float>(dx) / static_cast<float>(rx > 0 ? rx : 1);
-            int32_t arch_boost = static_cast<int32_t>(std::round((1.0f - norm_x * norm_x) * 4.0f));
+            int32_t arch_boost = static_cast<int32_t>(std::round((1.0f - norm_x * norm_x) * 5.0f));
             int32_t col_top_y = (center_y + ry) - base_lower_h - arch_boost;
             for (int32_t y = col_top_y; y <= center_y + ry; ++y) {
                 int32_t abs_dy = std::abs(y - center_y);
@@ -2959,18 +3246,9 @@ void PetController::renderLaserArmorEyebrow(
     float angle_deg,
     bool is_left_brow
 ) {
-    // Sobrancelhas expressivas: levemente erguidas (/ \) por padrão (amigável) e arqueadas com charme irônico em EMOTION_JUDGING
-    float effective_angle = is_left_brow ? angle_deg : -angle_deg;
-    if (current_emotion == EMOTION_JUDGING) {
-        if (!is_left_brow) {
-            // Arqueia a sobrancelha direita lá no alto com ângulo curioso/irônico (sem franzir!)
-            effective_angle = 8.0f;
-            center_y -= 6;
-        } else {
-            effective_angle = -3.0f;
-            center_y -= 1;
-        }
-    }
+    // O ângulo já vem calculado individualmente (left_brow_angle_deg / right_brow_angle_deg) permitindo expressões assimétricas ricas!
+    (void)is_left_brow;
+    float effective_angle = angle_deg;
 
     float rad = effective_angle * (3.14159265f / 180.0f);
     float cos_a = std::cos(rad);
@@ -3022,6 +3300,40 @@ void PetController::renderLaserArmorEyebrow(
     canvas.drawLine(lx0, ly0, lx1, ly1, TFT_WHITE);
 }
 
+void PetController::renderCyberCheekBlush(
+    M5Canvas& canvas,
+    int32_t left_eye_x,
+    int32_t right_eye_x,
+    int32_t left_eye_y,
+    int32_t right_eye_y,
+    uint32_t now_ms
+) {
+    if (current_pose.cheek_glow_intensity < 0.12f) {
+        return;
+    }
+
+    // Bochechas cibernéticas luminosas (traços diagonais neon /// abaixo das órbitas quando feliz, sorrindo ou recebendo cafuné)
+    bool pulse_bright = ((now_ms / 240U) % 2U) == 0U;
+    uint16_t blush_col = (current_pose.cheek_glow_intensity > 0.65f && pulse_bright)
+                             ? COLOR_CYBER_ORANGE
+                             : COLOR_OPTIC_EMERALD;
+
+    int32_t lx_base = left_eye_x - 22;
+    int32_t ly_base = left_eye_y + 24;
+    int32_t rx_base = right_eye_x + 12;
+    int32_t ry_base = right_eye_y + 24;
+
+    for (int i = 0; i < 3; ++i) {
+        int32_t offset = i * 5;
+        // Bochecha esquerda (///)
+        canvas.drawLine(lx_base + offset, ly_base + 5, lx_base + offset + 3, ly_base, blush_col);
+        canvas.drawLine(lx_base + offset + 1, ly_base + 5, lx_base + offset + 4, ly_base, blush_col);
+        // Bochecha direita (///)
+        canvas.drawLine(rx_base + offset, ry_base + 5, rx_base + offset + 3, ry_base, blush_col);
+        canvas.drawLine(rx_base + offset + 1, ry_base + 5, rx_base + offset + 4, ry_base, blush_col);
+    }
+}
+
 void PetController::renderTacticalCallouts(
     M5Canvas& canvas,
     int32_t left_eye_x,
@@ -3058,10 +3370,12 @@ void PetController::renderTacticalCallouts(
     const ExternalWorldContext& world_ctx = world_context_service.getWorldContext();
     const UserHabitMatrix& habits = oracle_brain.getHabitMatrix();
     uint32_t cycle_slot = (now_ms / 3200U) % 5U;
-    if (rain_simulation_override) {
+    if (now_ms < head_pat_until_ms) {
+        canvas.print("AFETO:CAFUNE+");
+    } else if (rain_simulation_override) {
         canvas.print("CLIMA:CHUVA[W]");
     } else if (cached_audio_data.is_typing_cadence) {
-        canvas.print("DSP:DIGITANDO");
+        canvas.print("DSP:LENDO COD");
     } else if (cached_audio_data.music_beat_active) {
         canvas.print("DSP:RITMO/BPM");
     } else if (cycle_slot == 0U) {
@@ -3124,7 +3438,7 @@ void PetController::renderTacticalCallouts(
 }
 
 void PetController::renderSynthesisReticleMouth(M5Canvas& canvas, int32_t mouth_x, int32_t mouth_y, uint32_t now_ms) {
-    // Boca de Retículo / Interface de Síntese compacta (largura 88px: X = 116..204) com curvatura emocional amigável
+    // Boca de Retículo / Interface de Síntese expressiva (largura 88px: X = 116..204) com contorno labial luminoso e curvas emocionais
     constexpr int32_t synth_total_w = 88;
     constexpr int32_t num_bars = 11;
     constexpr int32_t bar_w = 5;
@@ -3138,26 +3452,46 @@ void PetController::renderSynthesisReticleMouth(M5Canvas& canvas, int32_t mouth_
 
     uint16_t primary_col = getActiveOpticPrimaryColor();
 
-    // Colchetes laterais de contenção do sintetizador vocal (altura contida ±6px para não tocar na aba do Oráculo)
-    canvas.drawFastVLine(left_x - 5, mouth_y - 6, 13, primary_col);
-    canvas.drawFastHLine(left_x - 5, mouth_y - 6, 4, primary_col);
-    canvas.drawFastHLine(left_x - 5, mouth_y + 6, 4, primary_col);
+    // Colchetes laterais de contenção do sintetizador vocal (inclinam sutilmente junto com o sorriso!)
+    int32_t corner_lift = static_cast<int32_t>(std::round(current_pose.mouth_curve_factor * 2.5f));
+    canvas.drawFastVLine(left_x - 5, mouth_y - 6 - corner_lift, 13, primary_col);
+    canvas.drawFastHLine(left_x - 5, mouth_y - 6 - corner_lift, 4, primary_col);
+    canvas.drawFastHLine(left_x - 5, mouth_y + 6 - corner_lift, 4, primary_col);
 
+    int32_t right_lift = corner_lift + ((current_emotion == EMOTION_JUDGING) ? 2 : 0);
     int32_t right_bracket_x = left_x + synth_total_w + 3;
-    canvas.drawFastVLine(right_bracket_x, mouth_y - 6, 13, primary_col);
-    canvas.drawFastHLine(right_bracket_x - 3, mouth_y - 6, 4, primary_col);
-    canvas.drawFastHLine(right_bracket_x - 3, mouth_y + 6, 4, primary_col);
+    canvas.drawFastVLine(right_bracket_x, mouth_y - 6 - right_lift, 13, primary_col);
+    canvas.drawFastHLine(right_bracket_x - 3, mouth_y - 6 - right_lift, 4, primary_col);
+    canvas.drawFastHLine(right_bracket_x - 3, mouth_y + 6 - right_lift, 4, primary_col);
 
-    // Barras verticais moduladas pelo áudio (RMS Lip-Sync) e curvadas claramente em sorriso/smirk amigável
+    // Modo especial: Boca em 'O' de espanto (EMOTION_STARTLED) ou bocejo profundo (EMOTION_SLEEPY sem falar)
+    if (!lip_sync_state.is_speaking &&
+        (current_emotion == EMOTION_STARTLED || (current_emotion == EMOTION_SLEEPY && current_pose.mouth_open_height > 7.5f))) {
+        int32_t o_rx = (current_emotion == EMOTION_STARTLED) ? 14 : 11;
+        int32_t o_ry = (current_emotion == EMOTION_STARTLED) ? 7  : 6;
+        canvas.fillEllipse(mouth_x, mouth_y, o_rx, o_ry, COLOR_HUD_INNER_BG);
+        canvas.drawEllipse(mouth_x, mouth_y, o_rx, o_ry, primary_col);
+        canvas.drawEllipse(mouth_x, mouth_y, o_rx - 2, o_ry - 2, COLOR_CYBER_ICE_LIGHT);
+        canvas.drawFastHLine(mouth_x - 5, mouth_y, 11, TFT_WHITE);
+        return;
+    }
+
+    int32_t prev_cx = 0;
+    int32_t prev_top_y = 0;
+    int32_t prev_bot_y = 0;
+
+    // Barras verticais moduladas pelo áudio (RMS Lip-Sync) + contorno labial superior/inferior conectado
     for (int32_t i = 0; i < num_bars; ++i) {
         float norm_pos = (static_cast<float>(i) - 5.0f) / 5.0f; // [-1.0 .. +1.0]
         int32_t dist_center = std::abs(i - (num_bars / 2));
         float envelope = 1.0f - (static_cast<float>(dist_center) / static_cast<float>((num_bars / 2) + 1));
 
-        // Curvatura de sorriso (+mouth_curve_factor abaixa o centro e levanta as pontas laterais em U; em EMOTION_JUDGING faz um smirk maroto!)
-        float curve_arch = (0.45f - norm_pos * norm_pos) * current_pose.mouth_curve_factor * 5.2f;
+        // Curvatura emocional amplificada (+mouth_curve_factor abaixa o centro e levanta as pontas em U; em EMOTION_JUDGING faz smirk!)
+        float curve_arch = (0.48f - norm_pos * norm_pos) * current_pose.mouth_curve_factor * 7.2f;
         if (current_emotion == EMOTION_JUDGING) {
-            curve_arch -= norm_pos * 2.4f; // Sorriso de canto irônico (lado direito visivelmente mais alto)
+            curve_arch -= norm_pos * 3.4f; // Sorriso de canto irônico (lado direito visivelmente mais alto)
+        } else if (current_emotion == EMOTION_DIZZY) {
+            curve_arch = std::sin(norm_pos * 4.2f + static_cast<float>(now_ms) * 0.015f) * 3.5f; // Boca ondulada em curto-circuito!
         }
         int32_t bar_center_y = mouth_y + static_cast<int32_t>(std::round(curve_arch));
 
@@ -3166,13 +3500,18 @@ void PetController::renderSynthesisReticleMouth(M5Canvas& canvas, int32_t mouth_
             float wave = std::fabs(std::sin(static_cast<float>(now_ms) * 0.035f + static_cast<float>(i) * 0.85f));
             float active_amp = open_norm * envelope * (0.45f + 0.55f * wave);
             bar_half_h = 1 + static_cast<int32_t>(std::round(active_amp * 7.5f));
-        } else if (current_emotion == EMOTION_STARTLED) {
-            bar_half_h = 2 + static_cast<int32_t>((now_ms + i * 7U) % 5U);
+        } else if (now_ms < head_pat_until_ms || (current_emotion == EMOTION_HAPPY && current_pose.mouth_curve_factor > 0.85f)) {
+            // Sorriso aberto radiante no centro quando muito feliz ou recebendo carinho
+            bar_half_h = (dist_center <= 2) ? 3 : ((dist_center <= 4) ? 2 : 1);
         } else {
             bar_half_h = (i % 2 == 0) ? 2 : 1;
         }
 
         int32_t bx = left_x + (i * bar_step);
+        int32_t cx = bx + (bar_w / 2);
+        int32_t top_y = bar_center_y - bar_half_h;
+        int32_t bot_y = bar_center_y + bar_half_h;
+
         uint16_t bar_col = primary_col;
         if (bar_half_h >= 6) {
             bar_col = TFT_WHITE;
@@ -3180,11 +3519,20 @@ void PetController::renderSynthesisReticleMouth(M5Canvas& canvas, int32_t mouth_
             bar_col = COLOR_CYBER_ICE_LIGHT;
         }
 
-        canvas.fillRect(bx, bar_center_y - bar_half_h, bar_w, (bar_half_h * 2) + 1, bar_col);
+        canvas.fillRect(bx, top_y, bar_w, (bar_half_h * 2) + 1, bar_col);
         if (bar_half_h >= 4) {
-            canvas.drawFastHLine(bx, bar_center_y - bar_half_h - 2, bar_w, TFT_WHITE);
-            canvas.drawFastHLine(bx, bar_center_y + bar_half_h + 2, bar_w, TFT_WHITE);
+            canvas.drawFastHLine(bx, top_y - 2, bar_w, TFT_WHITE);
+            canvas.drawFastHLine(bx, bot_y + 2, bar_w, TFT_WHITE);
         }
+
+        // Conecta as barras com um feixe labial contínuo que deixa a expressão da boca imediatamente legível
+        if (i > 0) {
+            canvas.drawLine(prev_cx, prev_top_y, cx, top_y, COLOR_CYBER_ICE_LIGHT);
+            canvas.drawLine(prev_cx, prev_bot_y, cx, bot_y, primary_col);
+        }
+        prev_cx = cx;
+        prev_top_y = top_y;
+        prev_bot_y = bot_y;
     }
 }
 
@@ -3197,6 +3545,9 @@ void PetController::renderEmotionalParticles(
 ) {
     uint16_t primary_col = getActiveOpticPrimaryColor();
     int32_t mid_x = (left_eye_x + right_eye_x) / 2;
+
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextSize(1);
 
     // 1. Anel Neural de Processamento quando aguardando resposta da IA (Gemini Flash-Lite)
     if (oracle_brain.isWaitingAi()) {
@@ -3211,10 +3562,58 @@ void PetController::renderEmotionalParticles(
         return;
     }
 
-    // 2. Partículas de Hibernação ("Z" flutuantes ascendentes) em EMOTION_SLEEPING / EMOTION_SLEEPY
+    // 2. Corações pixelados e faíscas durante Cafuné / Carinho na cabeça
+    if (now_ms < head_pat_until_ms) {
+        for (int i = 0; i < 3; ++i) {
+            uint32_t phase = (now_ms / 28U + static_cast<uint32_t>(i * 17)) % 36U;
+            int32_t hx = mid_x - 28 + (i * 28) + static_cast<int32_t>(std::sin(static_cast<float>(phase) * 0.22f) * 4.0f);
+            int32_t hy = (eye_y - 12) - static_cast<int32_t>(phase / 2U);
+            if (hy > 34) {
+                uint16_t h_col = (i % 2 == 0) ? COLOR_CYBER_ORANGE : TFT_WHITE;
+                // Desenha mini-coração pixel art 7x6
+                canvas.fillRect(hx - 2, hy, 2, 2, h_col);
+                canvas.fillRect(hx + 1, hy, 2, 2, h_col);
+                canvas.fillRect(hx - 3, hy + 1, 7, 2, h_col);
+                canvas.fillRect(hx - 2, hy + 3, 5, 1, h_col);
+                canvas.fillRect(hx - 1, hy + 4, 3, 1, h_col);
+                canvas.drawPixel(hx, hy + 5, h_col);
+            }
+        }
+        return;
+    }
+
+    // 3. Partículas de Código ("</>", "01", "{}") subindo quando o usuário está digitando no teclado!
+    if (cached_audio_data.is_typing_cadence && current_emotion != EMOTION_SLEEPING) {
+        static const char* const CODE_TOKENS[3] = {"</>", "01", "{}"};
+        for (int i = 0; i < 3; ++i) {
+            uint32_t phase = (now_ms / 38U + static_cast<uint32_t>(i * 19)) % 44U;
+            int32_t tx = (i == 0) ? (left_eye_x - 36) : ((i == 1) ? (mid_x - 8) : (right_eye_x + 24));
+            int32_t ty = (eye_y + 8) - static_cast<int32_t>(phase / 2U);
+            if (ty > 34 && tx > 14 && tx < SCREEN_WIDTH - 28) {
+                canvas.setTextColor((i % 2 == 0) ? COLOR_OPTIC_EMERALD : COLOR_CYBER_ICE_LIGHT);
+                canvas.setCursor(tx, ty);
+                canvas.print(CODE_TOKENS[i]);
+            }
+        }
+    }
+
+    // 4. Notas Musicais Rítmicas quando há batida de música ativa no ambiente
+    if (cached_audio_data.music_beat_active && current_emotion != EMOTION_SLEEPING) {
+        for (int i = 0; i < 2; ++i) {
+            uint32_t phase = (now_ms / 32U + static_cast<uint32_t>(i * 23)) % 42U;
+            int32_t nx = (i == 0) ? (left_eye_x - 32) : (right_eye_x + 28);
+            int32_t ny = (eye_y + 4) - static_cast<int32_t>(phase / 2U);
+            if (ny > 34 && nx > 16 && nx < SCREEN_WIDTH - 18) {
+                uint16_t ncol = (i == 0) ? COLOR_CYBER_ORANGE : TFT_WHITE;
+                canvas.fillCircle(nx, ny + 4, 2, ncol);
+                canvas.drawFastVLine(nx + 2, ny - 2, 6, ncol);
+                canvas.drawFastHLine(nx + 2, ny - 2, 3, ncol);
+            }
+        }
+    }
+
+    // 5. Partículas de Hibernação ("Z" flutuantes ascendentes) em EMOTION_SLEEPING / EMOTION_SLEEPY
     if (current_emotion == EMOTION_SLEEPING || current_emotion == EMOTION_SLEEPY) {
-        canvas.setFont(&fonts::Font0);
-        canvas.setTextSize(1);
         for (int i = 0; i < 3; ++i) {
             uint32_t phase = (now_ms / 45U + static_cast<uint32_t>(i * 22)) % 60U;
             int32_t zx = right_eye_x + 18 + (i * 8) + static_cast<int32_t>(std::sin(static_cast<float>(phase) * 0.15f) * 3.0f);
@@ -3228,7 +3627,22 @@ void PetController::renderEmotionalParticles(
         return;
     }
 
-    // 3. Faíscas Luminosas de Bom Humor / Carinho / Sorriso em EMOTION_HAPPY
+    // 6. Emote de Interrogação / Curiosidade ("?") ao lado da sobrancelha arqueada em EMOTION_JUDGING
+    if (current_emotion == EMOTION_JUDGING) {
+        int32_t qx = right_eye_x + 28;
+        int32_t qy = eye_y - 24 + static_cast<int32_t>(std::sin(static_cast<float>(now_ms) * 0.008f) * 2.5f);
+        if (qx < SCREEN_WIDTH - 18 && qy > 32) {
+            canvas.setTextColor(COLOR_CYBER_ORANGE);
+            canvas.setCursor(qx + 1, qy + 1);
+            canvas.print("?");
+            canvas.setTextColor(TFT_WHITE);
+            canvas.setCursor(qx, qy);
+            canvas.print("?");
+        }
+        return;
+    }
+
+    // 7. Faíscas Luminosas de Bom Humor / Sorriso em EMOTION_HAPPY
     if (current_emotion == EMOTION_HAPPY) {
         for (int i = 0; i < 4; ++i) {
             uint32_t t = (now_ms / 35U + static_cast<uint32_t>(i * 19)) % 40U;
@@ -3243,11 +3657,49 @@ void PetController::renderEmotionalParticles(
         return;
     }
 
-    // 4. Ondas Acústicas Concêntricas em EMOTION_LISTENING (Escuta Ativa Hands-Free)
+    // 8. Ondas Acústicas Concêntricas em EMOTION_LISTENING (Escuta Ativa Hands-Free)
     if (current_emotion == EMOTION_LISTENING) {
         int32_t wave_r = 4 + static_cast<int32_t>((now_ms / 60U) % 12U);
         canvas.drawCircle(mid_x, eye_y, wave_r, primary_col);
         canvas.drawCircle(mid_x, eye_y, (wave_r + 6) % 16, COLOR_CYBER_ICE_LIGHT);
+    }
+}
+
+void PetController::renderFloatingHudPopups(M5Canvas& canvas, uint32_t now_ms) {
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextSize(1);
+
+    for (size_t i = 0; i < MAX_HUD_POPUPS; ++i) {
+        FloatingHudPopup& p = hud_popups[i];
+        if (!p.active) {
+            continue;
+        }
+        if (now_ms >= p.expire_ms || now_ms < p.spawn_ms) {
+            p.active = false;
+            continue;
+        }
+
+        float duration = static_cast<float>(p.expire_ms - p.spawn_ms);
+        float progress = (duration > 1.0f) ? (static_cast<float>(now_ms - p.spawn_ms) / duration) : 1.0f;
+        int32_t cur_y = static_cast<int32_t>(std::round(p.y - progress * 22.0f));
+        if (cur_y < 30) {
+            cur_y = 30;
+        }
+
+        int32_t text_w = static_cast<int32_t>(std::strlen(p.text)) * 6;
+        int32_t draw_x = static_cast<int32_t>(p.x) - (text_w / 2);
+        if (draw_x < 14) draw_x = 14;
+        if (draw_x + text_w > SCREEN_WIDTH - 14) draw_x = SCREEN_WIDTH - 14 - text_w;
+
+        // Pill tático semi-opaco com borda luminosa para leitura instantânea
+        canvas.fillRect(draw_x - 3, cur_y - 2, text_w + 6, 11, COLOR_HUD_PANEL_BG);
+        canvas.drawRect(draw_x - 3, cur_y - 2, text_w + 6, 11, p.color);
+        canvas.setTextColor(COLOR_TEXT_SHADOW);
+        canvas.setCursor(draw_x + 1, cur_y + 1);
+        canvas.print(p.text);
+        canvas.setTextColor(TFT_WHITE);
+        canvas.setCursor(draw_x, cur_y);
+        canvas.print(p.text);
     }
 }
 
@@ -3258,8 +3710,9 @@ void PetController::renderPetFace(M5Canvas& canvas) {
     // 1. Cockpit Sci-Fi 16-bit carregado do SD (ou Grid Cibernético 3D procedural como fallback)
     renderCyberGridBackground(canvas, now_ms);
 
-    int32_t shake_x = static_cast<int32_t>(current_pose.shake_offset_x);
-    int32_t shake_y = static_cast<int32_t>(current_pose.shake_offset_y);
+    int32_t shake_x  = static_cast<int32_t>(current_pose.shake_offset_x);
+    int32_t shake_y  = static_cast<int32_t>(current_pose.shake_offset_y);
+    int32_t breath_y = static_cast<int32_t>(std::round(current_pose.breathing_offset_y));
 
     // Quando o visor PIP estiver aberto no quadrante superior direito, desloca suavemente as órbitas para a esquerda
     // para que o olho direito jamais fique coberto pela janela da câmera/timelapse!
@@ -3267,9 +3720,9 @@ void PetController::renderPetFace(M5Canvas& canvas) {
     int32_t base_left_x  = pip_active ? 68  : FACE_EYE_LEFT_X;
     int32_t base_right_x = pip_active ? 168 : FACE_EYE_RIGHT_X;
 
-    // Posição base dos sensores ópticos acompanhando o olhar + inclinação lateral da cabeça (head roll)
+    // Posição base dos sensores ópticos acompanhando o olhar + respiração orgânica + inclinação lateral da cabeça (head roll)
     int32_t face_shift_x = static_cast<int32_t>(current_pose.current_eye_x * 0.40f) + shake_x;
-    int32_t face_shift_y = static_cast<int32_t>(current_pose.current_eye_y * 0.30f) + shake_y;
+    int32_t face_shift_y = static_cast<int32_t>(current_pose.current_eye_y * 0.30f) + shake_y + breath_y;
     int32_t tilt_shift_y = static_cast<int32_t>(current_pose.head_tilt_deg * 0.25f);
 
     int32_t left_eye_x  = base_left_x + face_shift_x;
@@ -3291,28 +3744,31 @@ void PetController::renderPetFace(M5Canvas& canvas) {
     // 2. Linhas de chamada táticas e telemetria lateral
     renderTacticalCallouts(canvas, left_eye_x, right_eye_x, eye_y, now_ms);
 
-    // 2.5. Partículas Emocionais Dinâmicas (Anel Neural de IA, Faíscas Felizes, Ondas de Escuta ou "Z" de Sono)
+    // 2.5. Partículas Emocionais Dinâmicas (Anel Neural, Corações de Cafuné, Código Digitando, Notas Musicais, "?" ou "Z")
     renderEmotionalParticles(canvas, left_eye_x, right_eye_x, eye_y, now_ms);
 
-    // 3. Olhos de Lente Óptica HD (texturizados via SD 64x64 RGB565 com colméia hexagonal e Lens Flare)
+    // 3. Olhos de Lente Óptica HD com Squash & Stretch e Pálpebras Independentes
     renderCombatOpticEye(canvas, left_eye_x, left_eye_y, pupil_dx, pupil_dy, true, now_ms);
     renderCombatOpticEye(canvas, right_eye_x, right_eye_y, pupil_dx, pupil_dy, false, now_ms);
 
-    // 4. Sobrancelhas expressivas com feixe luminoso na cor do humor atual
+    // 3.5. Bochechas Cibernéticas Luminosas (Blush ///) quando feliz, sorrindo ou recebendo cafuné
+    renderCyberCheekBlush(canvas, left_eye_x, right_eye_x, left_eye_y, right_eye_y, now_ms);
+
+    // 4. Sobrancelhas independentes com feixe luminoso na cor do humor atual
     int32_t brow_dist = pip_active ? 22 : 25;
-    int32_t left_brow_y  = (left_eye_y - brow_dist) + static_cast<int32_t>(current_pose.eyebrow_offset_y);
-    int32_t right_brow_y = (right_eye_y - brow_dist) + static_cast<int32_t>(current_pose.eyebrow_offset_y);
-    if (left_brow_y < 36) left_brow_y = 36;   // Garante que nunca invada o HUD superior (Y <= 29)
-    if (right_brow_y < 36) right_brow_y = 36;
+    int32_t left_brow_y  = (left_eye_y - brow_dist) + static_cast<int32_t>(current_pose.left_brow_offset_y);
+    int32_t right_brow_y = (right_eye_y - brow_dist) + static_cast<int32_t>(current_pose.right_brow_offset_y);
+    if (left_brow_y < 35) left_brow_y = 35;   // Garante que nunca invada o HUD superior (Y <= 29)
+    if (right_brow_y < 35) right_brow_y = 35;
     float tilt_brow_mod  = current_pose.head_tilt_deg * 0.30f;
-    renderLaserArmorEyebrow(canvas, left_eye_x + 2, left_brow_y, current_pose.eyebrow_angle_deg + tilt_brow_mod, true);
-    renderLaserArmorEyebrow(canvas, right_eye_x - 2, right_brow_y, current_pose.eyebrow_angle_deg - tilt_brow_mod, false);
+    renderLaserArmorEyebrow(canvas, left_eye_x + 2, left_brow_y, current_pose.left_brow_angle_deg + tilt_brow_mod, true);
+    renderLaserArmorEyebrow(canvas, right_eye_x - 2, right_brow_y, current_pose.right_brow_angle_deg - tilt_brow_mod, false);
 
     current_pose.eye_radius_current = saved_eye_r;
 
-    // 5. Boca de Retículo / Interface de Síntese Vocal centralizada com curvatura emocional
+    // 5. Boca de Retículo / Interface de Síntese Vocal centralizada com curvatura emocional e respiração sutil
     int32_t mouth_x = (SCREEN_WIDTH / 2) + static_cast<int32_t>(current_pose.current_eye_x * 0.30f) + shake_x;
-    int32_t mouth_y = FACE_MOUTH_BASE_Y + static_cast<int32_t>(current_pose.current_eye_y * 0.20f) + shake_y;
+    int32_t mouth_y = FACE_MOUTH_BASE_Y + static_cast<int32_t>(current_pose.current_eye_y * 0.20f) + shake_y + (breath_y / 2);
     renderSynthesisReticleMouth(canvas, mouth_x, mouth_y, now_ms);
 }
 
@@ -3449,7 +3905,7 @@ void PetController::renderTopCyberSystemsHud(M5Canvas& canvas, const GazeTargetD
 }
 
 void PetController::renderSideAudioVuMeters(M5Canvas& canvas, const AudioSensorData& audio_data, uint32_t now_ms) {
-    // VU Meters de Áudio Laterais: colunas de 11 blocos de LEDs virtuais empilhados nas margens esquerda e direita
+    // VU Meters de Áudio Laterais: colunas de 11 blocos de LEDs virtuais empilhados nas margens esquerda e direita + Peak-Hold
     constexpr int32_t num_leds = 11;
     constexpr int32_t led_w = 7;
     constexpr int32_t led_h = 6;
@@ -3477,6 +3933,27 @@ void PetController::renderSideAudioVuMeters(M5Canvas& canvas, const AudioSensorD
     int32_t lit_count = 2 + static_cast<int32_t>(std::round(db_norm * static_cast<float>(num_leds - 2)));
     if (lit_count > num_leds) lit_count = num_leds;
 
+    // Leve variação entre canal esquerdo e direito em picos altos
+    int32_t right_lit = lit_count;
+    if (lit_count > 3 && ((now_ms / 90U) % 2U == 1U)) {
+        right_lit = (lit_count > 2) ? (lit_count - 1) : lit_count;
+    }
+
+    // Atualiza Peak-Hold com queda suave por gravidade a cada 95ms
+    if (static_cast<float>(lit_count - 1) > vu_peak_left) {
+        vu_peak_left = static_cast<float>(lit_count - 1);
+    }
+    if (static_cast<float>(right_lit - 1) > vu_peak_right) {
+        vu_peak_right = static_cast<float>(right_lit - 1);
+    }
+    if (now_ms - last_vu_decay_ms >= 95U) {
+        last_vu_decay_ms = now_ms;
+        if (vu_peak_left > 1.0f)  vu_peak_left  -= 0.35f;
+        if (vu_peak_right > 1.0f) vu_peak_right -= 0.35f;
+    }
+    int32_t peak_idx_l = static_cast<int32_t>(std::round(vu_peak_left));
+    int32_t peak_idx_r = static_cast<int32_t>(std::round(vu_peak_right));
+
     // Moldura vertical das torres de VU Meter
     int32_t top_y = bottom_y - ((num_leds - 1) * led_pitch) - 3;
     canvas.drawRect(left_x - 2, top_y, led_w + 4, (num_leds * led_pitch) + 4, COLOR_CYBER_GRID_BLUE);
@@ -3491,14 +3968,8 @@ void PetController::renderSideAudioVuMeters(M5Canvas& canvas, const AudioSensorD
             active_col = COLOR_CYBER_ICE_LIGHT;   // Meio-alto (6..8): Azul-gelo brilhante
         }
 
-        // Leve variação entre canal esquerdo e direito em picos altos
-        int32_t right_lit = lit_count;
-        if (lit_count > 3 && ((now_ms / 90U) % 2U == 1U)) {
-            right_lit = (lit_count > 2) ? (lit_count - 1) : lit_count;
-        }
-
-        uint16_t col_l = (i < lit_count) ? active_col : COLOR_HUD_BADGE_BG;
-        uint16_t col_r = (i < right_lit) ? active_col : COLOR_HUD_BADGE_BG;
+        uint16_t col_l = (i < lit_count) ? active_col : ((i == peak_idx_l && peak_idx_l >= 2) ? COLOR_CYBER_ORANGE : COLOR_HUD_BADGE_BG);
+        uint16_t col_r = (i < right_lit) ? active_col : ((i == peak_idx_r && peak_idx_r >= 2) ? COLOR_CYBER_ORANGE : COLOR_HUD_BADGE_BG);
 
         canvas.fillRect(left_x, ly, led_w, led_h, col_l);
         canvas.fillRect(right_x, ly, led_w, led_h, col_r);
@@ -4373,6 +4844,9 @@ void PetController::renderDialogueAndHud(M5Canvas& canvas, float measured_fps, c
 
     // 3.5. Gotas refrativas de chuva escorrendo pelo vidro frontal do visor e respingando na borda do Oráculo
     renderVisorRainDrops(canvas, now_ms, true);
+
+    // 3.8. Popups flutuantes de feedback instantâneo (+XP, +HUMOR, CAFUNÉ, FOCO)
+    renderFloatingHudPopups(canvas, now_ms);
 
     // 4. Efeito de Interferência Eletromagnética / Glitch de Vídeo no susto ou chacoalhão do IMU
     applyVideoGlitchEffect(canvas, now_ms);

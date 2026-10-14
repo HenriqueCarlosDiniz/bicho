@@ -80,6 +80,31 @@ struct FacePoseGeometry {
     float mouth_curve_factor;       // Curvatura da boca (-1.0 triste/ranzinza, 0 neutro, +1.0 feliz)
     float shake_offset_x;           // Tremor horizontal (usado no susto/raiva)
     float shake_offset_y;           // Tremor vertical (usado no susto/raiva)
+    float eye_scale_x;              // Escala horizontal elástica (Squash & Stretch)
+    float eye_scale_y;              // Escala vertical elástica (Squash & Stretch)
+    float left_upper_lid;           // Fechamento independente da pálpebra superior esquerda (assimetria/wink)
+    float right_upper_lid;          // Fechamento independente da pálpebra superior direita (assimetria/wink)
+    float left_lower_lid;           // Fechamento independente da pálpebra inferior esquerda
+    float right_lower_lid;          // Fechamento independente da pálpebra inferior direita
+    float left_brow_angle_deg;      // Ângulo independente da sobrancelha esquerda
+    float right_brow_angle_deg;     // Ângulo independente da sobrancelha direita
+    float left_brow_offset_y;       // Altura independente da sobrancelha esquerda
+    float right_brow_offset_y;      // Altura independente da sobrancelha direita
+    float breathing_offset_y;       // Oscilação vertical orgânica de respiração do rosto
+    float cheek_glow_intensity;     // Intensidade das bochechas cibernéticas luminosas (0.0 a 1.0)
+};
+
+constexpr uint8_t MAX_HUD_POPUPS = 4;
+
+struct FloatingHudPopup {
+    char text[28];                  // Texto curto do popup (ex: "+10 XP", "♥ CARINHO!", "+8 HUMOR")
+    float x;                        // Posição X na tela
+    float y;                        // Posição Y atual (sobe suavemente)
+    float vy;                       // Velocidade vertical de subida
+    uint16_t color;                 // Cor RGB565 do popup
+    uint32_t spawn_ms;              // Instante de criação
+    uint32_t expire_ms;             // Instante de expiração
+    bool active;                    // Indica se o slot está ativo
 };
 
 struct LipSyncState {
@@ -214,6 +239,20 @@ private:
     bool rain_simulation_override;
     VisorRainDrop visor_raindrops[VISOR_RAINDROP_COUNT];
 
+    // Estado de Expressividade Avançada, Cafuné (Head Pat), Piscadinha (Wink), Peak-Hold VU e Popups Flutuantes
+    uint32_t head_pat_until_ms;
+    uint32_t last_head_pat_reward_ms;
+    uint32_t wink_until_ms;
+    uint32_t next_wink_ms;
+    uint32_t blink_bounce_until_ms;
+    int32_t last_touch_x;
+    int32_t last_touch_y;
+    float touch_stroke_accum;
+    float vu_peak_left;
+    float vu_peak_right;
+    uint32_t last_vu_decay_ms;
+    FloatingHudPopup hud_popups[MAX_HUD_POPUPS];
+
     // Métodos internos de percepção, interpolação, DSP de voz, gráficos SD e regras de negócio (camelCase)
     void updatePresenceAndFocus(const GazeTargetData& gaze_data, const AudioSensorData& audio_data, uint32_t now_ms);
     void updateAcousticReactions(const AudioSensorData& audio_data, const EnvironmentSensorData& env_data, uint32_t now_ms);
@@ -236,15 +275,18 @@ private:
     void initVisorRainDrops();
     void updateVisorRainDrops(uint32_t now_ms);
     bool isRainingOnVisor() const;
+    void spawnHudPopup(const char* text, float x, float y, uint16_t color, uint32_t duration_ms = 1800U);
 
     // Métodos auxiliares de renderização estilo "Cyber-Guerreiro" / HUD Militar (camelCase)
     void renderCyberGridBackground(M5Canvas& canvas, uint32_t now_ms);
     void renderVisorRainDrops(M5Canvas& canvas, uint32_t now_ms, bool foreground_layer);
     void renderCombatOpticEye(M5Canvas& canvas, int32_t center_x, int32_t center_y, int32_t pupil_dx, int32_t pupil_dy, bool is_left_eye, uint32_t now_ms);
     void renderLaserArmorEyebrow(M5Canvas& canvas, int32_t center_x, int32_t center_y, float angle_deg, bool is_left_brow);
+    void renderCyberCheekBlush(M5Canvas& canvas, int32_t left_eye_x, int32_t right_eye_x, int32_t left_eye_y, int32_t right_eye_y, uint32_t now_ms);
     void renderTacticalCallouts(M5Canvas& canvas, int32_t left_eye_x, int32_t right_eye_x, int32_t eye_y, uint32_t now_ms);
     void renderSynthesisReticleMouth(M5Canvas& canvas, int32_t mouth_x, int32_t mouth_y, uint32_t now_ms);
     void renderEmotionalParticles(M5Canvas& canvas, int32_t left_eye_x, int32_t right_eye_x, int32_t eye_y, uint32_t now_ms);
+    void renderFloatingHudPopups(M5Canvas& canvas, uint32_t now_ms);
     void renderTopCyberSystemsHud(M5Canvas& canvas, const GazeTargetData& gaze_data, uint32_t now_ms);
     void renderSideAudioVuMeters(M5Canvas& canvas, const AudioSensorData& audio_data, uint32_t now_ms);
     void renderTacticalDialogueOverlay(M5Canvas& canvas, const char* subtitle_text, uint32_t now_ms);
