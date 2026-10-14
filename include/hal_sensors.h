@@ -55,12 +55,10 @@ constexpr size_t MAX_VOICE_NOTES_FILES = 20; // Limite máximo de notas de voz a
 constexpr const char* PET_SAVE_FILE_PATH = "pet_save.json";
 constexpr const char* PET_NVS_NAMESPACE = "bicho_nvs";
 constexpr const char* FACE_TRACK_FILE_PATH = "face_track.txt";
-constexpr const char* CAM_SNAP_FILE_PATH = "cam_snap.jpg";
 constexpr const char* CAM_PIP_FILE_PATH = "cam_pip.raw";
 constexpr const char* CAM_PIP_HD_FILE_PATH = "cam_pip_hd.raw";
 constexpr const char* CAM_PIP_RGB565_FILE_PATH = "cam_pip_rgb565.raw";
 constexpr const char* CAM_PIP_HD_RGB565_FILE_PATH = "cam_pip_hd_rgb565.raw";
-constexpr const char* SD_CONFIG_FILE_PATH = "sd_card/config.json";
 constexpr const char* LOCAL_TIMEZONE_POSIX = "<-03>3"; // America/Sao_Paulo (UTC-3, sem horário de verão)
 
 // Dimensões do Visor Tático Picture-in-Picture (PIP 64x48 padrão e 160x120 Zoom HD)

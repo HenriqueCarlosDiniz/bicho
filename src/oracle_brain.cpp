@@ -1,5 +1,6 @@
 #include "oracle_brain.h"
 #include "json_utils.h"
+#include "storage.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,8 +13,6 @@
 
 #if defined(ARDUINO)
 #include <Preferences.h>
-#include <SPI.h>
-#include <SD.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -206,17 +205,12 @@ std::string OracleBrain::resolveApiKey() const {
         return std::string(alt_env_key);
     }
 #endif
-    // Fallback para chave configurada no cartão SD (sd_card/config.json)
-    FILE* cfg = std::fopen(SD_CONFIG_FILE_PATH, "r");
-    if (cfg != nullptr) {
-        char buf[1024] = {0};
-        size_t n = std::fread(buf, 1, sizeof(buf) - 1, cfg);
-        std::fclose(cfg);
-        buf[n] = '\0';
-        std::string sd_key;
-        if (extractJsonStringField(std::string(buf), "gemini_api_key", sd_key) && sd_key.size() > 10) {
-            return sd_key;
-        }
+    // Fallback para chave configurada no cartão SD (config.json)
+    std::string cfg_text;
+    std::string sd_key;
+    if (storageReadText(SD_CONFIG_FILE_PATH, cfg_text) &&
+        extractJsonStringField(cfg_text, "gemini_api_key", sd_key) && sd_key.size() > 10) {
+        return sd_key;
     }
     return "";
 }
@@ -1028,92 +1022,28 @@ std::string OracleBrain::toLowerAscii(const std::string& input_str) const {
 }
 
 bool OracleBrain::initSdCardDirectories() {
-#if defined(ARDUINO)
-    // No M5Stack CoreS3, o leitor microSD (TF Card) usa CS no pino GPIO 4 via barramento SPI
-    if (!SD.begin(GPIO_NUM_4, SPI, 25000000)) {
-        M5_LOGW("[SD-MEM] Cartao microSD nao detectado no GPIO 4. Usando fallback NVS Flash.");
+    // O cartão é montado uma vez em setup() (storageBegin); aqui só garante a estrutura de pastas
+    if (!storageBegin()) {
+        M5_LOGW("[SD-MEM] Cartao microSD indisponivel. Usando fallback NVS Flash.");
         return false;
     }
-    if (!SD.exists(SD_ROOT_DIR))        SD.mkdir(SD_ROOT_DIR);
-    if (!SD.exists(SD_MEMORY_DIR))      SD.mkdir(SD_MEMORY_DIR);
-    if (!SD.exists(SD_TTS_CACHE_DIR))   SD.mkdir(SD_TTS_CACHE_DIR);
-    if (!SD.exists(SD_SNAPSHOTS_DIR))   SD.mkdir(SD_SNAPSHOTS_DIR);
-    if (!SD.exists(SD_SFX_DIR))         SD.mkdir(SD_SFX_DIR);
-    if (!SD.exists(SD_AMBIENT_DIR))     SD.mkdir(SD_AMBIENT_DIR);
-    if (!SD.exists(SD_VOICE_NOTES_DIR)) SD.mkdir(SD_VOICE_NOTES_DIR);
-    if (!SD.exists(SD_GFX_DIR))         SD.mkdir(SD_GFX_DIR);
-    if (!SD.exists(SD_GFX_THEMES_DIR))  SD.mkdir(SD_GFX_THEMES_DIR);
-    if (!SD.exists(SD_GFX_EYES_DIR))    SD.mkdir(SD_GFX_EYES_DIR);
-    if (!SD.exists(SD_GFX_ICONS_DIR))   SD.mkdir(SD_GFX_ICONS_DIR);
-    M5_LOGI("[SD-MEM] Cartao microSD montado com sucesso em %s!", SD_ROOT_DIR);
+    const char* const REQUIRED_DIRS[] = {
+        SD_MEMORY_DIR, SD_TTS_CACHE_DIR, SD_SNAPSHOTS_DIR, SD_SFX_DIR, SD_AMBIENT_DIR,
+        SD_VOICE_NOTES_DIR, SD_GFX_DIR, SD_GFX_THEMES_DIR, SD_GFX_EYES_DIR, SD_GFX_ICONS_DIR
+    };
+    for (const char* dir : REQUIRED_DIRS) {
+        storageMakeDirs(dir);
+    }
+    M5_LOGI("[SD-MEM] Armazenamento pronto em '%s'.", STORAGE_ROOT);
     return true;
-#else
-#if defined(_WIN32)
-    _mkdir(SD_ROOT_DIR);
-    _mkdir(SD_MEMORY_DIR);
-    _mkdir(SD_TTS_CACHE_DIR);
-    _mkdir(SD_SNAPSHOTS_DIR);
-    _mkdir(SD_SFX_DIR);
-    _mkdir(SD_AMBIENT_DIR);
-    _mkdir(SD_VOICE_NOTES_DIR);
-    _mkdir(SD_GFX_DIR);
-    _mkdir(SD_GFX_THEMES_DIR);
-    _mkdir(SD_GFX_EYES_DIR);
-    _mkdir(SD_GFX_ICONS_DIR);
-#else
-    mkdir(SD_ROOT_DIR, 0777);
-    mkdir(SD_MEMORY_DIR, 0777);
-    mkdir(SD_TTS_CACHE_DIR, 0777);
-    mkdir(SD_SNAPSHOTS_DIR, 0777);
-    mkdir(SD_SFX_DIR, 0777);
-    mkdir(SD_AMBIENT_DIR, 0777);
-    mkdir(SD_VOICE_NOTES_DIR, 0777);
-    mkdir(SD_GFX_DIR, 0777);
-    mkdir(SD_GFX_THEMES_DIR, 0777);
-    mkdir(SD_GFX_EYES_DIR, 0777);
-    mkdir(SD_GFX_ICONS_DIR, 0777);
-#endif
-    M5_LOGI("[SD-MEM] Diretorios do Cartao SD virtual inicializados em '%s/'!", SD_ROOT_DIR);
-    return true;
-#endif
 }
 
 bool OracleBrain::loadPermanentProfileFromSd() {
     if (!sd_storage_ready) {
         return false;
     }
-#if defined(ARDUINO)
-    if (!SD.exists(SD_USER_PROFILE_FILE)) {
-        return false;
-    }
-    File f = SD.open(SD_USER_PROFILE_FILE, FILE_READ);
-    if (!f) {
-        return false;
-    }
     permanent_profile_facts.clear();
-    while (f.available()) {
-        String line_s = f.readStringUntil('\n');
-        std::string line(line_s.c_str());
-        if (line.find("permanent_facts") != std::string::npos) continue;
-        size_t fq = line.find('\"');
-        size_t lq = line.rfind('\"');
-        if (fq != std::string::npos && lq != std::string::npos && lq > fq) {
-            std::string fact = line.substr(fq + 1, lq - fq - 1);
-            if (!fact.empty() && permanent_profile_facts.size() < MAX_PERMANENT_FACTS) {
-                permanent_profile_facts.push_back(fact);
-            }
-        }
-    }
-    f.close();
-    return !permanent_profile_facts.empty();
-#else
-    std::ifstream f(SD_USER_PROFILE_FILE, std::ios::binary);
-    if (!f.is_open()) {
-        return false;
-    }
-    permanent_profile_facts.clear();
-    std::string line;
-    while (std::getline(f, line)) {
+    for (const std::string& line : storageReadLines(SD_USER_PROFILE_FILE)) {
         if (line.find("permanent_facts") != std::string::npos) continue;
         size_t fq = line.find('\"');
         size_t lq = line.rfind('\"');
@@ -1125,7 +1055,6 @@ bool OracleBrain::loadPermanentProfileFromSd() {
         }
     }
     return !permanent_profile_facts.empty();
-#endif
 }
 
 bool OracleBrain::savePermanentProfileToSd() const {
@@ -1139,19 +1068,7 @@ bool OracleBrain::savePermanentProfileToSd() const {
         json += "\n";
     }
     json += "  ]\n}\n";
-
-#if defined(ARDUINO)
-    File f = SD.open(SD_USER_PROFILE_FILE, FILE_WRITE);
-    if (!f) return false;
-    f.print(json.c_str());
-    f.close();
-    return true;
-#else
-    std::ofstream f(SD_USER_PROFILE_FILE, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) return false;
-    f.write(json.data(), static_cast<std::streamsize>(json.size()));
-    return true;
-#endif
+    return storageWriteText(SD_USER_PROFILE_FILE, json);
 }
 
 void OracleBrain::addPermanentProfileFact(const std::string& permanent_fact) {
@@ -1192,28 +1109,7 @@ bool OracleBrain::loadRecentRepliesFromSpeechLog() {
     }
 
     std::string content;
-#if defined(ARDUINO)
-    if (!SD.exists(SD_SPEECH_LOG_FILE)) {
-        return false;
-    }
-    File f = SD.open(SD_SPEECH_LOG_FILE, FILE_READ);
-    if (!f) {
-        return false;
-    }
-    while (f.available()) {
-        content.push_back(static_cast<char>(f.read()));
-    }
-    f.close();
-#else
-    std::ifstream f(SD_SPEECH_LOG_FILE, std::ios::binary);
-    if (!f.is_open()) {
-        return false;
-    }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    content = ss.str();
-#endif
-
+    storageReadText(SD_SPEECH_LOG_FILE, content);
     if (content.empty()) {
         return false;
     }
@@ -1295,7 +1191,7 @@ void OracleBrain::recordSpokenPhraseToSd(const std::string& reply_text,
     std::snprintf(
         line_buf,
         sizeof(line_buf),
-        "{\"date\":\"%s\",\"hour\":%u,\"source\":\"%s\",\"trigger\":\"%s\",\"wav\":\"%s\",\"reply\":\"%s\"}\n",
+        "{\"date\":\"%s\",\"hour\":%u,\"source\":\"%s\",\"trigger\":\"%s\",\"wav\":\"%s\",\"reply\":\"%s\"}",
         escapeJsonString(date_str).c_str(),
         static_cast<unsigned int>(hour_val),
         escapeJsonString(source_tag.empty() ? "LOCAL" : source_tag).c_str(),
@@ -1304,21 +1200,7 @@ void OracleBrain::recordSpokenPhraseToSd(const std::string& reply_text,
         escapeJsonString(reply_text).c_str()
     );
 
-#if defined(ARDUINO)
-    File f = SD.open(SD_SPEECH_LOG_FILE, FILE_APPEND);
-    if (!f) {
-        f = SD.open(SD_SPEECH_LOG_FILE, FILE_WRITE);
-    }
-    if (f) {
-        f.print(line_buf);
-        f.close();
-    }
-#else
-    std::ofstream f(SD_SPEECH_LOG_FILE, std::ios::binary | std::ios::app);
-    if (f.is_open()) {
-        f.write(line_buf, static_cast<std::streamsize>(std::strlen(line_buf)));
-    }
-#endif
+    storageAppendLine(SD_SPEECH_LOG_FILE, line_buf);
 }
 
 bool OracleBrain::appendEpisodicRecordToSd(const EpisodicMemoryRecord& record) {
@@ -1329,7 +1211,7 @@ bool OracleBrain::appendEpisodicRecordToSd(const EpisodicMemoryRecord& record) {
     std::snprintf(
         line_buf,
         sizeof(line_buf),
-        "{\"date\":\"%s\",\"hour\":%u,\"trigger\":\"%s\",\"mood\":%d,\"tags\":\"%s\",\"fact\":\"%s\"}\n",
+        "{\"date\":\"%s\",\"hour\":%u,\"trigger\":\"%s\",\"mood\":%d,\"tags\":\"%s\",\"fact\":\"%s\"}",
         escapeJsonString(record.date_str).c_str(),
         static_cast<unsigned int>(record.hour_of_day),
         escapeJsonString(record.trigger_reason).c_str(),
@@ -1338,23 +1220,11 @@ bool OracleBrain::appendEpisodicRecordToSd(const EpisodicMemoryRecord& record) {
         escapeJsonString(record.memory_fact).c_str()
     );
 
-#if defined(ARDUINO)
-    File f = SD.open(SD_EPISODIC_LOG_FILE, FILE_APPEND);
-    if (!f) {
-        f = SD.open(SD_EPISODIC_LOG_FILE, FILE_WRITE);
+    if (!storageAppendLine(SD_EPISODIC_LOG_FILE, line_buf)) {
+        return false;
     }
-    if (!f) return false;
-    f.print(line_buf);
-    f.close();
     ++total_episodic_records;
     return true;
-#else
-    std::ofstream f(SD_EPISODIC_LOG_FILE, std::ios::binary | std::ios::app);
-    if (!f.is_open()) return false;
-    f << line_buf;
-    ++total_episodic_records;
-    return true;
-#endif
 }
 
 bool OracleBrain::loadRecentMemoriesFromEpisodicLog() {
@@ -1362,34 +1232,12 @@ bool OracleBrain::loadRecentMemoriesFromEpisodicLog() {
         return false;
     }
     std::vector<std::string> all_facts;
-#if defined(ARDUINO)
-    if (!SD.exists(SD_EPISODIC_LOG_FILE)) {
-        return false;
-    }
-    File f = SD.open(SD_EPISODIC_LOG_FILE, FILE_READ);
-    if (!f) return false;
-    while (f.available()) {
-        String line_s = f.readStringUntil('\n');
-        std::string line(line_s.c_str());
+    for (const std::string& line : storageReadLines(SD_EPISODIC_LOG_FILE)) {
         std::string fact;
         if (extractJsonStringField(line, "fact", fact) && !fact.empty()) {
             all_facts.push_back(fact);
         }
     }
-    f.close();
-#else
-    std::ifstream f(SD_EPISODIC_LOG_FILE, std::ios::binary);
-    if (!f.is_open()) {
-        return false;
-    }
-    std::string line;
-    while (std::getline(f, line)) {
-        std::string fact;
-        if (extractJsonStringField(line, "fact", fact) && !fact.empty()) {
-            all_facts.push_back(fact);
-        }
-    }
-#endif
     if (all_facts.empty()) {
         return false;
     }
@@ -1412,45 +1260,17 @@ void OracleBrain::consolidatePreviousDaysLogs() {
 
     // 1. Lê resumos diários já existentes no SD
     daily_summaries.clear();
-#if defined(ARDUINO)
-    if (SD.exists(SD_DAILY_SUMMARY_FILE)) {
-        File sf = SD.open(SD_DAILY_SUMMARY_FILE, FILE_READ);
-        if (sf) {
-            while (sf.available()) {
-                String ls = sf.readStringUntil('\n');
-                std::string line(ls.c_str());
-                DailySummaryRecord rec;
-                int32_t ev_cnt = 0;
-                if (extractJsonStringField(line, "date", rec.date_str) &&
-                    extractJsonStringField(line, "highlight", rec.highlight_fact)) {
-                    extractJsonIntField(line, "events", ev_cnt);
-                    extractJsonIntField(line, "avg_mood", rec.avg_mood_score);
-                    rec.total_events = static_cast<uint32_t>(ev_cnt > 0 ? ev_cnt : 1);
-                    daily_summaries.push_back(rec);
-                }
-            }
-            sf.close();
+    for (const std::string& line : storageReadLines(SD_DAILY_SUMMARY_FILE)) {
+        DailySummaryRecord rec;
+        int32_t ev_cnt = 0;
+        if (extractJsonStringField(line, "date", rec.date_str) &&
+            extractJsonStringField(line, "highlight", rec.highlight_fact)) {
+            extractJsonIntField(line, "events", ev_cnt);
+            extractJsonIntField(line, "avg_mood", rec.avg_mood_score);
+            rec.total_events = static_cast<uint32_t>(ev_cnt > 0 ? ev_cnt : 1);
+            daily_summaries.push_back(rec);
         }
     }
-#else
-    {
-        std::ifstream sf(SD_DAILY_SUMMARY_FILE, std::ios::binary);
-        if (sf.is_open()) {
-            std::string line;
-            while (std::getline(sf, line)) {
-                DailySummaryRecord rec;
-                int32_t ev_cnt = 0;
-                if (extractJsonStringField(line, "date", rec.date_str) &&
-                    extractJsonStringField(line, "highlight", rec.highlight_fact)) {
-                    extractJsonIntField(line, "events", ev_cnt);
-                    extractJsonIntField(line, "avg_mood", rec.avg_mood_score);
-                    rec.total_events = static_cast<uint32_t>(ev_cnt > 0 ? ev_cnt : 1);
-                    daily_summaries.push_back(rec);
-                }
-            }
-        }
-    }
-#endif
 
     // 2. Verifica no episodic_log.jsonl se há algum dia anterior (date != today_date) ainda não consolidado
     std::string candidate_date;
@@ -1458,19 +1278,7 @@ void OracleBrain::consolidatePreviousDaysLogs() {
     int64_t candidate_mood_sum = 0;
     std::string candidate_highlight;
 
-#if defined(ARDUINO)
-    if (!SD.exists(SD_EPISODIC_LOG_FILE)) return;
-    File ef = SD.open(SD_EPISODIC_LOG_FILE, FILE_READ);
-    if (!ef) return;
-    while (ef.available()) {
-        String ls = ef.readStringUntil('\n');
-        std::string line(ls.c_str());
-#else
-    std::ifstream ef(SD_EPISODIC_LOG_FILE, std::ios::binary);
-    if (!ef.is_open()) return;
-    std::string line;
-    while (std::getline(ef, line)) {
-#endif
+    for (const std::string& line : storageReadLines(SD_EPISODIC_LOG_FILE)) {
         std::string rec_date;
         std::string rec_fact;
         int32_t rec_mood = 70;
@@ -1499,9 +1307,6 @@ void OracleBrain::consolidatePreviousDaysLogs() {
             }
         }
     }
-#if defined(ARDUINO)
-    ef.close();
-#endif
 
     if (!candidate_date.empty() && candidate_count > 0) {
         DailySummaryRecord new_sum;
@@ -1516,24 +1321,12 @@ void OracleBrain::consolidatePreviousDaysLogs() {
 
         char sum_line[360];
         std::snprintf(sum_line, sizeof(sum_line),
-                      "{\"date\":\"%s\",\"events\":%u,\"avg_mood\":%d,\"highlight\":\"%s\"}\n",
+                      "{\"date\":\"%s\",\"events\":%u,\"avg_mood\":%d,\"highlight\":\"%s\"}",
                       escapeJsonString(new_sum.date_str).c_str(),
                       static_cast<unsigned int>(new_sum.total_events),
                       static_cast<int>(new_sum.avg_mood_score),
                       escapeJsonString(new_sum.highlight_fact).c_str());
-#if defined(ARDUINO)
-        File out_f = SD.open(SD_DAILY_SUMMARY_FILE, FILE_APPEND);
-        if (!out_f) out_f = SD.open(SD_DAILY_SUMMARY_FILE, FILE_WRITE);
-        if (out_f) {
-            out_f.print(sum_line);
-            out_f.close();
-        }
-#else
-        std::ofstream out_f(SD_DAILY_SUMMARY_FILE, std::ios::binary | std::ios::app);
-        if (out_f.is_open()) {
-            out_f << sum_line;
-        }
-#endif
+        storageAppendLine(SD_DAILY_SUMMARY_FILE, sum_line);
     }
 }
 
@@ -1572,19 +1365,7 @@ std::vector<std::string> OracleBrain::retrieveRelevantMemories(const OracleConte
     };
     std::vector<ScoredMemory> scored_candidates;
 
-#if defined(ARDUINO)
-    if (!SD.exists(SD_EPISODIC_LOG_FILE)) return results;
-    File f = SD.open(SD_EPISODIC_LOG_FILE, FILE_READ);
-    if (!f) return results;
-    while (f.available()) {
-        String ls = f.readStringUntil('\n');
-        std::string line(ls.c_str());
-#else
-    std::ifstream f(SD_EPISODIC_LOG_FILE, std::ios::binary);
-    if (!f.is_open()) return results;
-    std::string line;
-    while (std::getline(f, line)) {
-#endif
+    for (const std::string& line : storageReadLines(SD_EPISODIC_LOG_FILE)) {
         std::string fact;
         if (!extractJsonStringField(line, "fact", fact) || fact.empty()) {
             continue;
@@ -1629,9 +1410,6 @@ std::vector<std::string> OracleBrain::retrieveRelevantMemories(const OracleConte
             scored_candidates.push_back({score, entry_label});
         }
     }
-#if defined(ARDUINO)
-    f.close();
-#endif
 
     // Ordena pelas memórias de maior relevância semântica (Micro-RAG)
     for (size_t i = 0; i < scored_candidates.size(); ++i) {
@@ -1718,22 +1496,7 @@ bool OracleBrain::loadHabitMatrixFromSd() {
         return false;
     }
     std::string content;
-#if defined(ARDUINO)
-    if (!SD.exists(SD_HABIT_MATRIX_FILE)) return false;
-    File f = SD.open(SD_HABIT_MATRIX_FILE, FILE_READ);
-    if (!f) return false;
-    while (f.available()) {
-        content += static_cast<char>(f.read());
-    }
-    f.close();
-#else
-    std::ifstream f(SD_HABIT_MATRIX_FILE, std::ios::binary);
-    if (!f.is_open()) return false;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    content = ss.str();
-#endif
-    if (content.empty()) return false;
+    if (!storageReadText(SD_HABIT_MATRIX_FILE, content) || content.empty()) return false;
 
     int32_t v = 0;
     if (extractJsonIntField(content, "total_pomodoros_completed", v) && v >= 0)
@@ -1793,18 +1556,7 @@ bool OracleBrain::saveHabitMatrixToSd() const {
     ss << "}\n";
     std::string out_str = ss.str();
 
-#if defined(ARDUINO)
-    File f = SD.open(SD_HABIT_MATRIX_FILE, FILE_WRITE);
-    if (!f) return false;
-    f.print(out_str.c_str());
-    f.close();
-    return true;
-#else
-    std::ofstream f(SD_HABIT_MATRIX_FILE, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) return false;
-    f.write(out_str.data(), static_cast<std::streamsize>(out_str.size()));
-    return true;
-#endif
+    return storageWriteText(SD_HABIT_MATRIX_FILE, ss.str());
 }
 
 void OracleBrain::addXpPoints(uint32_t delta_xp) {
@@ -1913,14 +1665,17 @@ bool OracleBrain::saveEventSnapshotToSd(const std::string& event_tag) const {
     if (!sd_storage_ready) {
         return false;
     }
-#if !defined(ARDUINO)
     std::time_t now_t = std::time(nullptr);
-    std::tm* lt = std::localtime(&now_t);
+    std::tm lt = {};
+#if defined(_WIN32)
+    const bool has_time = (localtime_s(&lt, &now_t) == 0) && (lt.tm_year + 1900) >= 2024;
+#else
+    const bool has_time = (localtime_r(&now_t, &lt) != nullptr) && (lt.tm_year + 1900) >= 2024;
+#endif
     char stamp_buf[32];
-    if (lt != nullptr) {
+    if (has_time) {
         std::snprintf(stamp_buf, sizeof(stamp_buf), "%04d%02d%02d_%02d%02d%02d",
-                      lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
-                      lt->tm_hour, lt->tm_min, lt->tm_sec);
+                      lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
     } else {
         int build_year = 0, build_month = 0, build_day = 0;
         getBuildDate(build_year, build_month, build_day);
@@ -1928,42 +1683,28 @@ bool OracleBrain::saveEventSnapshotToSd(const std::string& event_tag) const {
                       static_cast<unsigned int>(M5.millis() / 1000U % 1000000U));
     }
 
-    // 1. Arquiva o quadro PIP 64x48 em escala de cinza para a Galeria Timelapse [G]
-    std::ifstream pip_src(CAM_PIP_FILE_PATH, std::ios::binary);
-    if (pip_src.is_open()) {
+    // 1. Arquiva o quadro PIP 64x48 em escala de cinza para a Galeria Timelapse [G] (quando existe em arquivo)
+    std::vector<uint8_t> bytes;
+    if (storageReadFile(CAM_PIP_FILE_PATH, bytes) && bytes.size() >= PIP_FRAME_BYTES) {
         char pip_fname[160];
         std::snprintf(pip_fname, sizeof(pip_fname), "%s/pip_%s_%s.raw",
                       SD_SNAPSHOTS_DIR, stamp_buf, event_tag.c_str());
-        std::ofstream pip_dst(pip_fname, std::ios::binary | std::ios::trunc);
-        if (pip_dst.is_open()) {
-            pip_dst << pip_src.rdbuf();
-            pip_dst.close();
-            std::ofstream idx_out(SD_PIP_INDEX_FILE, std::ios::binary | std::ios::app);
-            if (idx_out.is_open()) {
-                idx_out << pip_fname << "\n";
-            }
+        if (storageWriteFile(pip_fname, bytes.data(), bytes.size())) {
+            storageAppendLine(SD_PIP_INDEX_FILE, pip_fname);
         }
     }
 
-    // 2. Arquiva a foto JPEG 320x240 completa no álbum do Cartão SD
-    std::ifstream src("cam_snap.jpg", std::ios::binary);
-    if (!src.is_open()) {
+    // 2. Arquiva a foto JPEG 320x240 mais recente no álbum do Cartão SD
+    if (!storageReadFile(CAM_SNAP_FILE_PATH, bytes) || bytes.size() <= 256) {
         return false;
     }
     char fname[160];
-    std::snprintf(fname, sizeof(fname), "%s/snap_%s_%s.jpg",
-                  SD_SNAPSHOTS_DIR, stamp_buf, event_tag.c_str());
-    std::ofstream dst(fname, std::ios::binary | std::ios::trunc);
-    if (!dst.is_open()) {
+    std::snprintf(fname, sizeof(fname), "%s/snap_%s_%s.jpg", SD_SNAPSHOTS_DIR, stamp_buf, event_tag.c_str());
+    if (!storageWriteFile(fname, bytes.data(), bytes.size())) {
         return false;
     }
-    dst << src.rdbuf();
-    M5_LOGI("[SD-ALBUM] Snapshot + Frame Timelapse PIP salvos no Cartao SD: %s", fname);
+    M5_LOGI("[SD-ALBUM] Snapshot salvo no Cartao SD: %s", fname);
     return true;
-#else
-    (void)event_tag;
-    return false;
-#endif
 }
 
 std::vector<std::string> OracleBrain::listSnapshotPipFilesFromSd() const {
@@ -1971,37 +1712,14 @@ std::vector<std::string> OracleBrain::listSnapshotPipFilesFromSd() const {
     if (!sd_storage_ready) {
         return files;
     }
-#if defined(ARDUINO)
-    if (!SD.exists(SD_PIP_INDEX_FILE)) {
-        return files;
-    }
-    File f = SD.open(SD_PIP_INDEX_FILE, FILE_READ);
-    if (!f) {
-        return files;
-    }
-    while (f.available()) {
-        String s = f.readStringUntil('\n');
-        s.trim();
-        if (s.length() > 4) {
-            files.push_back(std::string(s.c_str()));
-        }
-    }
-    f.close();
-#else
-    std::ifstream f(SD_PIP_INDEX_FILE, std::ios::binary);
-    if (!f.is_open()) {
-        return files;
-    }
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+    for (std::string line : storageReadLines(SD_PIP_INDEX_FILE)) {
+        while (!line.empty() && line.back() == ' ') {
             line.pop_back();
         }
         if (line.size() > 4) {
             files.push_back(line);
         }
     }
-#endif
     // Mantém os últimos 12 quadros para um replay timelapse ágil
     if (files.size() > 12) {
         files.erase(files.begin(), files.end() - 12);
@@ -2013,26 +1731,12 @@ bool OracleBrain::loadPipRawFileFromSd(const std::string& pip_file_path, uint8_t
     if (!sd_storage_ready || out_gray_64x48 == nullptr || pip_file_path.empty()) {
         return false;
     }
-#if defined(ARDUINO)
-    if (!SD.exists(pip_file_path.c_str())) {
+    std::vector<uint8_t> bytes;
+    if (!storageReadFile(pip_file_path, bytes) || bytes.size() < PIP_FRAME_BYTES) {
         return false;
     }
-    File f = SD.open(pip_file_path.c_str(), FILE_READ);
-    if (!f || f.size() < PIP_FRAME_BYTES) {
-        if (f) f.close();
-        return false;
-    }
-    size_t read_b = f.read(out_gray_64x48, PIP_FRAME_BYTES);
-    f.close();
-    return (read_b == PIP_FRAME_BYTES);
-#else
-    std::ifstream f(pip_file_path, std::ios::binary);
-    if (!f.is_open()) {
-        return false;
-    }
-    f.read(reinterpret_cast<char*>(out_gray_64x48), static_cast<std::streamsize>(PIP_FRAME_BYTES));
-    return (f.gcount() == static_cast<std::streamsize>(PIP_FRAME_BYTES));
-#endif
+    std::memcpy(out_gray_64x48, bytes.data(), PIP_FRAME_BYTES);
+    return true;
 }
 
 std::vector<uint8_t> OracleBrain::decodeBase64(const std::string& b64_input) {

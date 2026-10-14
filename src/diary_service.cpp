@@ -4,15 +4,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include "storage.h"
 #if defined(ARDUINO)
-#include <SD.h>
 #include <esp_pthread.h>
-#else
-#include <fstream>
-#include <sys/stat.h>
-#if defined(_WIN32)
-#include <direct.h>
-#endif
 #endif
 
 // =============================================================================
@@ -28,94 +22,11 @@ const std::string WEEK_FILE = DIARY_DIR + "/week.json";
 std::string eventsPath(const std::string& date) { return EVENTS_DIR + "/" + date + ".jsonl"; }
 std::string chaptersPath(const std::string& date) { return DIARY_DIR + "/" + date + ".jsonl"; }
 
-void ensureDirectory(const std::string& path) {
-#if defined(ARDUINO)
-    if (!SD.exists(path.c_str())) {
-        SD.mkdir(path.c_str());
-    }
-#elif defined(_WIN32)
-    _mkdir(path.c_str());
-#else
-    mkdir(path.c_str(), 0755);
-#endif
-}
-
-bool fileExists(const std::string& path) {
-#if defined(ARDUINO)
-    return SD.exists(path.c_str());
-#else
-    struct stat st;
-    return stat(path.c_str(), &st) == 0;
-#endif
-}
-
-bool appendLine(const std::string& path, const std::string& line) {
-#if defined(ARDUINO)
-    File f = SD.open(path.c_str(), FILE_APPEND);
-    if (!f) {
-        return false;
-    }
-    f.print(line.c_str());
-    f.print("\n");
-    f.close();
-    return true;
-#else
-    std::ofstream f(path, std::ios::binary | std::ios::app);
-    if (!f.is_open()) {
-        return false;
-    }
-    f << line << "\n";
-    return f.good();
-#endif
-}
-
-bool writeText(const std::string& path, const std::string& text) {
-#if defined(ARDUINO)
-    File f = SD.open(path.c_str(), FILE_WRITE);
-    if (!f) {
-        return false;
-    }
-    f.print(text.c_str());
-    f.close();
-    return true;
-#else
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) {
-        return false;
-    }
-    f << text;
-    return f.good();
-#endif
-}
-
-std::vector<std::string> readLines(const std::string& path) {
-    std::vector<std::string> lines;
-#if defined(ARDUINO)
-    File f = SD.open(path.c_str(), FILE_READ);
-    if (!f) {
-        return lines;
-    }
-    while (f.available()) {
-        String l = f.readStringUntil('\n');
-        if (l.length() > 0) {
-            lines.emplace_back(l.c_str());
-        }
-    }
-    f.close();
-#else
-    std::ifstream f(path, std::ios::binary);
-    std::string l;
-    while (std::getline(f, l)) {
-        if (!l.empty() && l.back() == '\r') {
-            l.pop_back();
-        }
-        if (!l.empty()) {
-            lines.push_back(l);
-        }
-    }
-#endif
-    return lines;
-}
+void ensureDirectory(const std::string& path) { storageMakeDirs(path); }
+bool fileExists(const std::string& path) { return storageExists(path); }
+bool appendLine(const std::string& path, const std::string& line) { return storageAppendLine(path, line); }
+bool writeText(const std::string& path, const std::string& text) { return storageWriteText(path, text); }
+std::vector<std::string> readLines(const std::string& path) { return storageReadLines(path); }
 
 // Relógio local válido? (no CoreS3 só depois do NTP; antes disso o ano é 1970)
 bool localTimeAt(std::time_t t, std::tm& out) {

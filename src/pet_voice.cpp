@@ -10,33 +10,9 @@ bool PetController::playSdSoundEffect(HalSensors& hal_sensors, const char* relat
     // Para o canal de áudio antes de realocar sfx_wav_buffer para evitar leitura concorrente na thread de som SDL2/I2S
     M5.Speaker.stop();
 
-#if defined(ARDUINO)
-    if (!SD.exists(relative_sd_path)) {
+    if (!storageReadFile(relative_sd_path, sfx_wav_buffer) || sfx_wav_buffer.size() <= VOICE_WAV_HEADER_OFFSET) {
         return false;
     }
-    File f = SD.open(relative_sd_path, FILE_READ);
-    if (!f || f.size() <= VOICE_WAV_HEADER_OFFSET) {
-        return false;
-    }
-    size_t sz = f.size();
-    sfx_wav_buffer.resize(sz);
-    f.read(sfx_wav_buffer.data(), sz);
-    f.close();
-#else
-    std::ifstream f(relative_sd_path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        return false;
-    }
-    std::streamsize sz = f.tellg();
-    if (sz <= static_cast<std::streamsize>(VOICE_WAV_HEADER_OFFSET)) {
-        return false;
-    }
-    f.seekg(0, std::ios::beg);
-    sfx_wav_buffer.resize(static_cast<size_t>(sz));
-    if (!f.read(reinterpret_cast<char*>(sfx_wav_buffer.data()), sz)) {
-        return false;
-    }
-#endif
 
     hal_sensors.switchAudioBusMode(AUDIO_MODE_SPEAKER);
     M5.Speaker.playWav(sfx_wav_buffer.data(), sfx_wav_buffer.size());
@@ -366,7 +342,7 @@ void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_
     lip_sync_state.current_char_index = 0;
     lip_sync_state.is_speaking = true;
 
-    // Registra a fala no log persistente (sd_card/memory/speech_log.jsonl) e no histórico anti-repetição
+    // Registra a fala no log persistente (memory/speech_log.jsonl no cartão) e no histórico anti-repetição
     oracle_brain.recordSpokenPhraseToSd(lip_sync_state.full_text, "LOCAL", "LOCAL_REACTION");
 
     // 1. Pede a voz neural em Português ao worker em background; a legenda e a boca começam quando

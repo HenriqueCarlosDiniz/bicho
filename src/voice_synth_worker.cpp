@@ -6,7 +6,7 @@
 #include <cstring>
 #include <fstream>
 #if defined(ARDUINO)
-#include <SD.h>
+#include "storage.h"
 #include <esp_pthread.h>
 #endif
 
@@ -72,17 +72,10 @@ uint32_t VoiceSynthWorker::request(const char* text_utf8, PetEmotionState emotio
         }
         char cache_path[128];
         std::snprintf(cache_path, sizeof(cache_path), "%s/tts_%08x.wav", SD_TTS_CACHE_DIR, static_cast<unsigned int>(fnv_hash));
-        if (SD.exists(cache_path)) {
-            File cached_wav = SD.open(cache_path, FILE_READ);
-            if (cached_wav && cached_wav.size() > 44) {
-                size_t fsize = cached_wav.size();
-                preloaded_wav.resize(fsize);
-                cached_wav.read(preloaded_wav.data(), fsize);
-                M5_LOGI("[SD-TTS] Voz neural 24kHz carregada do cache SD: %s", cache_path);
-            }
-            if (cached_wav) {
-                cached_wav.close();
-            }
+        if (storageReadFile(cache_path, preloaded_wav) && preloaded_wav.size() > 44) {
+            M5_LOGI("[SD-TTS] Voz neural 24kHz carregada do cache SD: %s", cache_path);
+        } else {
+            preloaded_wav.clear();
         }
     }
 #endif
@@ -128,10 +121,7 @@ bool VoiceSynthWorker::poll(uint32_t job_id, bool& out_ok, std::vector<uint8_t>&
     // Persiste o WAV bruto 24kHz recém-sintetizado no microSD a partir da thread principal (Core 1)
     if (!raw_wav_to_save.empty() && !cache_path_to_save.empty() &&
         oracle_brain != nullptr && oracle_brain->isSdStorageReady()) {
-        File out_file = SD.open(cache_path_to_save.c_str(), FILE_WRITE);
-        if (out_file) {
-            out_file.write(raw_wav_to_save.data(), raw_wav_to_save.size());
-            out_file.close();
+        if (storageWriteFile(cache_path_to_save, raw_wav_to_save.data(), raw_wav_to_save.size())) {
             M5_LOGI("[SD-TTS] Voz Cloud Gemini 24kHz salva no cache microSD: %s", cache_path_to_save.c_str());
         }
     }
@@ -223,19 +213,9 @@ bool VoiceSynthWorker::synthesizeWithCache(const std::string& text_utf8,
     (void)out_cache_path;
     (void)out_raw_wav_for_cache;
     // Passo 1 (Caminho 3): WAV já salvo no cache do Cartão SD espelhado no PC
-    {
-        std::ifstream cached_file(cache_path, std::ios::binary | std::ios::ate);
-        if (cached_file.is_open()) {
-            std::streamsize c_size = cached_file.tellg();
-            if (c_size > 44) {
-                cached_file.seekg(0, std::ios::beg);
-                out_wav.resize(static_cast<size_t>(c_size));
-                if (cached_file.read(reinterpret_cast<char*>(out_wav.data()), c_size)) {
-                    loaded_raw_wav = true;
-                    M5_LOGI("[SD-TTS] Voz neural 24kHz carregada do cache SD: %s", cache_path);
-                }
-            }
-        }
+    if (storageReadFile(cache_path, out_wav) && out_wav.size() > 44) {
+        loaded_raw_wav = true;
+        M5_LOGI("[SD-TTS] Voz neural 24kHz carregada do cache SD: %s", cache_path);
     }
 
     // Passo 2 (Caminho 1): edge-tts local (se instalado) ou Gemini Cloud TTS, e salva no cache SD
@@ -280,10 +260,7 @@ bool VoiceSynthWorker::synthesizeWithCache(const std::string& text_utf8,
         }
 
         if (loaded_raw_wav && oracle_brain->isSdStorageReady()) {
-            std::ofstream sd_cache_out(cache_path, std::ios::binary | std::ios::trunc);
-            if (sd_cache_out.is_open()) {
-                sd_cache_out.write(reinterpret_cast<const char*>(out_wav.data()),
-                                   static_cast<std::streamsize>(out_wav.size()));
+            if (storageWriteFile(cache_path, out_wav.data(), out_wav.size())) {
                 M5_LOGI("[SD-TTS] Frase sintetizada em 24kHz HD e salva no cache do Cartao SD: %s", cache_path);
             }
         }

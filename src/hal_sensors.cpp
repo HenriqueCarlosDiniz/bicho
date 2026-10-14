@@ -1,6 +1,7 @@
 #include "hal_sensors.h"
 #include "world_context.h"
 #include "pc_process.h"
+#include "storage.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -252,18 +253,10 @@ HalSensors::~HalSensors() {
 }
 
 bool HalSensors::loadOrInitSdConfig() {
-    FILE* f = std::fopen(SD_CONFIG_FILE_PATH, "r");
-    if (f == nullptr) {
-        // Garante diretório sd_card/ e cria sd_card/config.json padrão se ainda não existir
-#if !defined(ARDUINO)
-#if defined(_WIN32)
-        std::system("if not exist \"sd_card\" mkdir \"sd_card\" >nul 2>&1");
-#else
-        mkdir("sd_card", 0755);
-#endif
-#endif
-        FILE* wf = std::fopen(SD_CONFIG_FILE_PATH, "w");
-        if (wf != nullptr) {
+    std::string cfg_text;
+    if (!storageReadText(SD_CONFIG_FILE_PATH, cfg_text)) {
+        // Cria o config.json padrão na raiz do cartão (ou de sd_card/ no PC) se ainda não existir
+        if (storageMakeDirs(SD_ROOT_DIR)) {
             JsonDocument cfg_doc;
             cfg_doc["wifi_ssid"] = sd_config.wifi_ssid;
             cfg_doc["wifi_password"] = sd_config.wifi_password;
@@ -275,22 +268,14 @@ bool HalSensors::loadOrInitSdConfig() {
             cfg_doc["morning_briefing_enabled"] = sd_config.morning_briefing_enabled;
             cfg_doc["diary_enabled"] = sd_config.diary_enabled;
             cfg_doc["diary_store_transcripts"] = sd_config.diary_store_transcripts;
-            std::string cfg_text;
-            serializeJsonPretty(cfg_doc, cfg_text);
-            std::fwrite(cfg_text.data(), 1, cfg_text.size(), wf);
-            std::fclose(wf);
-            M5_LOGI("[SD-CFG] Arquivo padrao '%s' gerado no Cartao SD.", SD_CONFIG_FILE_PATH);
+            std::string default_text;
+            serializeJsonPretty(cfg_doc, default_text);
+            if (storageWriteText(SD_CONFIG_FILE_PATH, default_text)) {
+                M5_LOGI("[SD-CFG] Arquivo padrao '%s' gerado no Cartao SD.", SD_CONFIG_FILE_PATH);
+            }
         }
         return true;
     }
-
-    std::string cfg_text;
-    char chunk[256];
-    size_t n = 0;
-    while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0) {
-        cfg_text.append(chunk, n);
-    }
-    std::fclose(f);
 
     JsonDocument cfg_doc;
     DeserializationError cfg_err = deserializeJson(cfg_doc, cfg_text);
@@ -325,10 +310,7 @@ bool HalSensors::loadOrInitSdConfig() {
         cfg_doc["diary_store_transcripts"] = sd_config.diary_store_transcripts;
         std::string upgraded;
         serializeJsonPretty(cfg_doc, upgraded);
-        FILE* uf = std::fopen(SD_CONFIG_FILE_PATH, "w");
-        if (uf != nullptr) {
-            std::fwrite(upgraded.data(), 1, upgraded.size(), uf);
-            std::fclose(uf);
+        if (storageWriteText(SD_CONFIG_FILE_PATH, upgraded)) {
             M5_LOGI("[SD-CFG] '%s' atualizado com as opcoes do Diario (diary_enabled, diary_store_transcripts).", SD_CONFIG_FILE_PATH);
         }
     }
@@ -1030,65 +1012,53 @@ std::string HalSensors::recordUserAudioWav() const {
 
     std::memcpy(&wav_bytes[44], pcm_samples.data(), data_chunk_bytes);
 
-    // 3. Arquiva na "Caixa Preta" de Notas de Voz do Cartão SD (sd_card/voice_notes/)
-    FILE* last_out = std::fopen("sd_card/voice_notes/voice_last.wav", "wb");
-    if (last_out != nullptr) {
-        std::fwrite(wav_bytes.data(), 1, wav_bytes.size(), last_out);
-        std::fclose(last_out);
-    }
+    // 3. Arquiva na "Caixa Preta" de Notas de Voz do Cartão SD (voice_notes/)
+    const std::string notes_dir = SD_VOICE_NOTES_DIR;
+    storageWriteFile(notes_dir + "/voice_last.wav", wav_bytes.data(), wav_bytes.size());
 
     std::time_t now_t = std::time(nullptr);
-    std::tm* lt = std::localtime(&now_t);
-    char stamp_path[128];
-    if (lt != nullptr) {
-        std::snprintf(stamp_path, sizeof(stamp_path),
-                      "sd_card/voice_notes/voice_%04d%02d%02d_%02d%02d%02d.wav",
-                      lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
-                      lt->tm_hour, lt->tm_min, lt->tm_sec);
-    } else {
-        std::snprintf(stamp_path, sizeof(stamp_path), "sd_card/voice_notes/voice_note.wav");
-    }
-    FILE* note_out = std::fopen(stamp_path, "wb");
-    if (note_out != nullptr) {
-        std::fwrite(wav_bytes.data(), 1, wav_bytes.size(), note_out);
-        std::fclose(note_out);
-    }
-
-#if __has_include(<dirent.h>)
-    // 4. Rotação de retenção de notas de voz: mantém no máximo os últimos MAX_VOICE_NOTES_FILES arquivos
-    DIR* notes_dir = opendir("sd_card/voice_notes");
-    if (notes_dir != nullptr) {
-        std::vector<std::string> voice_note_files;
-        struct dirent* entry = nullptr;
-        while ((entry = readdir(notes_dir)) != nullptr) {
-            std::string fname(entry->d_name);
-            if (fname.size() > 10 &&
-                fname.rfind("voice_", 0) == 0 &&
-                fname != "voice_last.wav" &&
-                fname != "voice_note.wav" &&
-                fname.substr(fname.size() - 4) == ".wav") {
-                voice_note_files.push_back("sd_card/voice_notes/" + fname);
-            }
-        }
-        closedir(notes_dir);
-
-        if (voice_note_files.size() > MAX_VOICE_NOTES_FILES) {
-            std::sort(voice_note_files.begin(), voice_note_files.end());
-            size_t excess_count = voice_note_files.size() - MAX_VOICE_NOTES_FILES;
-            for (size_t i = 0; i < excess_count; ++i) {
-                if (std::remove(voice_note_files[i].c_str()) == 0) {
-                    M5_LOGI("[HAL-AUDIO] Rotacao de notas de voz: arquivo antigo '%s' removido (limite=%u).",
-                            voice_note_files[i].c_str(),
-                            static_cast<unsigned int>(MAX_VOICE_NOTES_FILES));
-                }
-            }
-        }
-    }
+    std::tm lt = {};
+#if defined(_WIN32)
+    const bool has_time = (localtime_s(&lt, &now_t) == 0) && (lt.tm_year + 1900) >= 2024;
+#else
+    const bool has_time = (localtime_r(&now_t, &lt) != nullptr) && (lt.tm_year + 1900) >= 2024;
 #endif
+    char stamp_name[48];
+    if (has_time) {
+        std::snprintf(stamp_name, sizeof(stamp_name), "voice_%04d%02d%02d_%02d%02d%02d.wav",
+                      lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
+    } else {
+        std::snprintf(stamp_name, sizeof(stamp_name), "voice_note.wav");
+    }
+    storageWriteFile(notes_dir + "/" + stamp_name, wav_bytes.data(), wav_bytes.size());
 
-    M5_LOGI("[HAL-AUDIO] Audio real do usuario gravado (%u amostras / %u bytes WAV) e salvo em sd_card/voice_notes/.",
+    // 4. Rotação de retenção de notas de voz: mantém no máximo os últimos MAX_VOICE_NOTES_FILES arquivos
+    std::vector<std::string> voice_note_files;
+    for (const std::string& fname : storageListDir(notes_dir)) {
+        if (fname.size() > 10 &&
+            fname.rfind("voice_", 0) == 0 &&
+            fname != "voice_last.wav" &&
+            fname != "voice_note.wav" &&
+            fname.substr(fname.size() - 4) == ".wav") {
+            voice_note_files.push_back(notes_dir + "/" + fname);
+        }
+    }
+    if (voice_note_files.size() > MAX_VOICE_NOTES_FILES) {
+        std::sort(voice_note_files.begin(), voice_note_files.end());
+        size_t excess_count = voice_note_files.size() - MAX_VOICE_NOTES_FILES;
+        for (size_t i = 0; i < excess_count; ++i) {
+            if (storageRemove(voice_note_files[i])) {
+                M5_LOGI("[HAL-AUDIO] Rotacao de notas de voz: arquivo antigo '%s' removido (limite=%u).",
+                        voice_note_files[i].c_str(),
+                        static_cast<unsigned int>(MAX_VOICE_NOTES_FILES));
+            }
+        }
+    }
+
+    M5_LOGI("[HAL-AUDIO] Audio real do usuario gravado (%u amostras / %u bytes WAV) e salvo em %s.",
             static_cast<unsigned int>(pcm_samples.size()),
-            static_cast<unsigned int>(wav_bytes.size()));
+            static_cast<unsigned int>(wav_bytes.size()),
+            SD_VOICE_NOTES_DIR);
 
     return encodeBase64(wav_bytes.data(), wav_bytes.size());
 }
@@ -1108,11 +1078,7 @@ std::string HalSensors::captureCameraJpegBase64() const {
                 esp_camera_fb_return(fb);
                 return b64;
             } else if (frame2jpg(fb, 80, &jpg_buf, &jpg_len) && jpg_buf != nullptr && jpg_len > 128) {
-                FILE* snap_f = std::fopen(CAM_SNAP_FILE_PATH, "wb");
-                if (snap_f != nullptr) {
-                    std::fwrite(jpg_buf, 1, jpg_len, snap_f);
-                    std::fclose(snap_f);
-                }
+                storageWriteFile(CAM_SNAP_FILE_PATH, jpg_buf, jpg_len);
                 std::string b64 = encodeBase64(jpg_buf, jpg_len);
                 std::free(jpg_buf);
                 esp_camera_fb_return(fb);
@@ -1125,22 +1091,10 @@ std::string HalSensors::captureCameraJpegBase64() const {
     }
     cam_lock.unlock();
 #endif
-    // Fallback em caso de snapshot prévio salvo no SD do CoreS3
-    FILE* f = std::fopen(CAM_SNAP_FILE_PATH, "rb");
-    if (f != nullptr) {
-        std::fseek(f, 0, SEEK_END);
-        long sz = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        if (sz > 256) {
-            std::vector<uint8_t> buf(static_cast<size_t>(sz));
-            size_t rd = std::fread(buf.data(), 1, buf.size(), f);
-            std::fclose(f);
-            if (rd == buf.size()) {
-                return encodeBase64(buf.data(), buf.size());
-            }
-        } else {
-            std::fclose(f);
-        }
+    // Fallback: último snapshot salvo no cartão
+    std::vector<uint8_t> snap_bytes;
+    if (storageReadFile(CAM_SNAP_FILE_PATH, snap_bytes) && snap_bytes.size() > 256) {
+        return encodeBase64(snap_bytes.data(), snap_bytes.size());
     }
     return "";
 #else
@@ -1458,7 +1412,7 @@ void HalSensors::initCoreS3Peripherals() {
     }
 #endif
 
-    // 4. Conecta ao Wi-Fi priorizando sd_card/config.json com fallback para secrets.h
+    // 4. Conecta ao Wi-Fi priorizando o config.json do cartão com fallback para secrets.h
     const char* active_wifi_ssid = (std::strlen(sd_config.wifi_ssid) > 0 &&
                                     std::strcmp(sd_config.wifi_ssid, "SEU_WIFI_SSID") != 0)
                                        ? sd_config.wifi_ssid

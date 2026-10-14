@@ -34,29 +34,14 @@ static void writeWavFileToSdHelper(const char* file_path, const std::vector<int1
         static_cast<uint8_t>((pcm_bytes >> 24) & 0xFFU)
     };
 
-#if defined(ARDUINO)
-    File f = SD.open(file_path, FILE_WRITE);
-    if (f) {
-        f.write(header, 44);
-        f.write(reinterpret_cast<const uint8_t*>(samples.data()), pcm_bytes);
-        f.close();
-    }
-#else
-    std::ofstream f(file_path, std::ios::binary | std::ios::trunc);
-    if (f.is_open()) {
-        f.write(reinterpret_cast<const char*>(header), 44);
-        f.write(reinterpret_cast<const char*>(samples.data()), static_cast<std::streamsize>(pcm_bytes));
-    }
-#endif
+    std::vector<uint8_t> wav_bytes(header, header + 44);
+    const uint8_t* pcm = reinterpret_cast<const uint8_t*>(samples.data());
+    wav_bytes.insert(wav_bytes.end(), pcm, pcm + pcm_bytes);
+    storageWriteFile(file_path, wav_bytes.data(), wav_bytes.size());
 }
 
 static bool sdFileExistsHelper(const char* file_path) {
-#if defined(ARDUINO)
-    return SD.exists(file_path);
-#else
-    std::ifstream f(file_path, std::ios::binary);
-    return f.good();
-#endif
+    return storageExists(file_path);
 }
 
 void PetController::initOrGenerateSdAudioAssets() {
@@ -228,70 +213,41 @@ static uint16_t packRgb565DitheredHelper(int32_t x, int32_t y, float r_f, float 
 
 static bool writeRgb565AssetToSdHelper(const char* file_path, const uint16_t* pixels, size_t pixel_count) {
     size_t byte_len = pixel_count * sizeof(uint16_t);
-#if defined(ARDUINO)
-    File f = SD.open(file_path, FILE_WRITE);
-    if (!f) {
-        return false;
-    }
-    f.write(reinterpret_cast<const uint8_t*>(pixels), byte_len);
-    f.close();
-    return true;
-#else
-    std::ofstream f(file_path, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) {
-        return false;
-    }
-    f.write(reinterpret_cast<const char*>(pixels), static_cast<std::streamsize>(byte_len));
-    return f.good();
-#endif
+    return storageWriteFile(file_path, pixels, byte_len);
 }
 
 static bool readRgb565AssetFromSdHelper(const char* file_path, uint16_t* out_pixels, size_t pixel_count) {
     size_t byte_len = pixel_count * sizeof(uint16_t);
-#if defined(ARDUINO)
-    if (!SD.exists(file_path)) {
+    std::vector<uint8_t> bytes;
+    if (!storageReadFile(file_path, bytes) || bytes.size() < byte_len) {
         return false;
     }
-    File f = SD.open(file_path, FILE_READ);
-    if (!f || f.size() < byte_len) {
-        if (f) f.close();
-        return false;
-    }
-    size_t read_bytes = f.read(reinterpret_cast<uint8_t*>(out_pixels), byte_len);
-    f.close();
-    return (read_bytes == byte_len);
-#else
-    std::ifstream f(file_path, std::ios::binary);
-    if (!f.is_open()) {
-        return false;
-    }
-    f.read(reinterpret_cast<char*>(out_pixels), static_cast<std::streamsize>(byte_len));
-    return f.good();
-#endif
+    std::memcpy(out_pixels, bytes.data(), byte_len);
+    return true;
 }
 
 static const char* const SD_THEME_FILENAMES[SD_THEME_COUNT] = {
-    "sd_card/gfx/themes/theme_0_cyber_cyan.rgb565",
-    "sd_card/gfx/themes/theme_1_emerald_bio.rgb565",
-    "sd_card/gfx/themes/theme_2_solar_amber.rgb565",
-    "sd_card/gfx/themes/theme_3_tactical_red.rgb565"
+    BICHO_STORAGE_ROOT "/gfx/themes/theme_0_cyber_cyan.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/themes/theme_1_emerald_bio.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/themes/theme_2_solar_amber.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/themes/theme_3_tactical_red.rgb565"
 };
 
 static const char* const SD_EYE_LENS_FILENAMES[EYE_LENS_COLOR_COUNT] = {
-    "sd_card/gfx/eyes/eye_lens_0_cyan.rgb565",
-    "sd_card/gfx/eyes/eye_lens_1_emerald.rgb565",
-    "sd_card/gfx/eyes/eye_lens_2_amber.rgb565",
-    "sd_card/gfx/eyes/eye_lens_3_red.rgb565"
+    BICHO_STORAGE_ROOT "/gfx/eyes/eye_lens_0_cyan.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/eyes/eye_lens_1_emerald.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/eyes/eye_lens_2_amber.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/eyes/eye_lens_3_red.rgb565"
 };
 
 static const char* const SD_HUD_ICON_FILENAMES[HUD_ICON_COUNT] = {
-    "sd_card/gfx/icons/icon_0_core.rgb565",
-    "sd_card/gfx/icons/icon_1_focus.rgb565",
-    "sd_card/gfx/icons/icon_2_sd.rgb565",
-    "sd_card/gfx/icons/icon_3_audio.rgb565"
+    BICHO_STORAGE_ROOT "/gfx/icons/icon_0_core.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/icons/icon_1_focus.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/icons/icon_2_sd.rgb565",
+    BICHO_STORAGE_ROOT "/gfx/icons/icon_3_audio.rgb565"
 };
 
-static constexpr const char* SD_GFX_PALETTE_VERSION_FILE = "sd_card/gfx/palette_v3.ver";
+static constexpr const char* SD_GFX_PALETTE_VERSION_FILE = BICHO_STORAGE_ROOT "/gfx/palette_v3.ver";
 
 void PetController::initOrGenerateSdGraphicsAssets() {
     active_theme_bg_rgb565.assign(SCREEN_WIDTH * SCREEN_HEIGHT, COLOR_CYBER_BG_NAVY);

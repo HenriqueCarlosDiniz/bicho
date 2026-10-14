@@ -2,6 +2,7 @@
 #include <cmath>
 #include "hal_sensors.h"
 #include "pet_state.h"
+#include "storage.h"
 
 // =============================================================================
 // Constantes Visuais e de Animação (Padrão UPPER_CASE)
@@ -57,6 +58,11 @@ void setup() {
     cfg.internal_mic = true;
     cfg.internal_spk = true; // Habilita subsistema de áudio para M5.Speaker.tone() no Lip-Sync
     M5.begin(cfg);
+
+    // Monta o cartão microSD (CoreS3) / pasta sd_card (PC) antes de qualquer leitura de config.json
+    if (!storageBegin()) {
+        M5_LOGW("[STORAGE] Cartao microSD indisponivel: usando configuracao de secrets.h e memoria NVS.");
+    }
 
     M5.Speaker.setVolume(255);
 

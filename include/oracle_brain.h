@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include "hal_sensors.h"
+#include "storage.h"
 
 #include <atomic>
 #if !defined(ARDUINO)
@@ -44,44 +45,7 @@ constexpr const char* GEMINI_RESP_TEMP_FILE = "gemini_resp.json";
 constexpr const char* ORACLE_MEMORY_SAVE_FILE = "oracle_memories.json";
 constexpr const char* ORACLE_MEMORY_NVS_NAMESPACE = "bicho_mem";
 
-// Caminhos do Cartão microSD (ESP32-S3 SPI GPIO 4) e Espelho Local (native_pc)
-#if defined(ARDUINO)
-constexpr const char* SD_ROOT_DIR = "/bicho_sd";
-constexpr const char* SD_MEMORY_DIR = "/bicho_sd/memory";
-constexpr const char* SD_TTS_CACHE_DIR = "/bicho_sd/tts_cache";
-constexpr const char* SD_SNAPSHOTS_DIR = "/bicho_sd/snapshots";
-constexpr const char* SD_SFX_DIR = "/bicho_sd/sfx";
-constexpr const char* SD_AMBIENT_DIR = "/bicho_sd/ambient";
-constexpr const char* SD_VOICE_NOTES_DIR = "/bicho_sd/voice_notes";
-constexpr const char* SD_GFX_DIR = "/bicho_sd/gfx";
-constexpr const char* SD_GFX_THEMES_DIR = "/bicho_sd/gfx/themes";
-constexpr const char* SD_GFX_EYES_DIR = "/bicho_sd/gfx/eyes";
-constexpr const char* SD_GFX_ICONS_DIR = "/bicho_sd/gfx/icons";
-constexpr const char* SD_USER_PROFILE_FILE = "/bicho_sd/memory/user_profile.json";
-constexpr const char* SD_EPISODIC_LOG_FILE = "/bicho_sd/memory/episodic_log.jsonl";
-constexpr const char* SD_SPEECH_LOG_FILE = "/bicho_sd/memory/speech_log.jsonl";
-constexpr const char* SD_DAILY_SUMMARY_FILE = "/bicho_sd/memory/daily_summaries.jsonl";
-constexpr const char* SD_HABIT_MATRIX_FILE = "/bicho_sd/memory/habit_matrix.json";
-constexpr const char* SD_PIP_INDEX_FILE = "/bicho_sd/snapshots/pip_index.txt";
-#else
-constexpr const char* SD_ROOT_DIR = "sd_card";
-constexpr const char* SD_MEMORY_DIR = "sd_card/memory";
-constexpr const char* SD_TTS_CACHE_DIR = "sd_card/tts_cache";
-constexpr const char* SD_SNAPSHOTS_DIR = "sd_card/snapshots";
-constexpr const char* SD_SFX_DIR = "sd_card/sfx";
-constexpr const char* SD_AMBIENT_DIR = "sd_card/ambient";
-constexpr const char* SD_VOICE_NOTES_DIR = "sd_card/voice_notes";
-constexpr const char* SD_GFX_DIR = "sd_card/gfx";
-constexpr const char* SD_GFX_THEMES_DIR = "sd_card/gfx/themes";
-constexpr const char* SD_GFX_EYES_DIR = "sd_card/gfx/eyes";
-constexpr const char* SD_GFX_ICONS_DIR = "sd_card/gfx/icons";
-constexpr const char* SD_USER_PROFILE_FILE = "sd_card/memory/user_profile.json";
-constexpr const char* SD_EPISODIC_LOG_FILE = "sd_card/memory/episodic_log.jsonl";
-constexpr const char* SD_SPEECH_LOG_FILE = "sd_card/memory/speech_log.jsonl";
-constexpr const char* SD_DAILY_SUMMARY_FILE = "sd_card/memory/daily_summaries.jsonl";
-constexpr const char* SD_HABIT_MATRIX_FILE = "sd_card/memory/habit_matrix.json";
-constexpr const char* SD_PIP_INDEX_FILE = "sd_card/snapshots/pip_index.txt";
-#endif
+// Caminhos do Cartão microSD: definidos em storage.h (raiz única para PC e CoreS3)
 
 // =============================================================================
 // System Prompt Oficial da Persona Cibernética (UPPER_CASE)
