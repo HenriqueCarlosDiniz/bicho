@@ -13,8 +13,9 @@
 #elif __has_include(<SDL.h>)
 #include <SDL.h>
 #endif
-#include <mutex>
 #endif
+#include <mutex>
+#include <atomic>
 
 // =============================================================================
 // Constantes Globais de Hardware e Simulação (Padrão UPPER_CASE)
@@ -34,8 +35,20 @@ constexpr float MAX_SPL_DB = 100.0f;
 constexpr uint32_t MIC_CAPTURE_SAMPLE_RATE = 16000;
 constexpr uint8_t MIC_CAPTURE_CHANNELS = 1;
 constexpr uint16_t MIC_CAPTURE_BUFFER_FRAMES = 512;
-constexpr uint32_t MIC_RECORD_DURATION_SEC = 4;
-constexpr size_t MIC_RING_BUFFER_SAMPLES = MIC_CAPTURE_SAMPLE_RATE * MIC_RECORD_DURATION_SEC; // 64.000 amostras (4s)
+constexpr uint32_t MIC_RECORD_DURATION_SEC = 12;
+constexpr size_t MIC_RING_BUFFER_SAMPLES = MIC_CAPTURE_SAMPLE_RATE * MIC_RECORD_DURATION_SEC; // 192.000 amostras (12s)
+
+// Máquina de estados do VAD Hands-Free (baseada em tempo, idêntica no PC e no CoreS3)
+constexpr uint32_t MIC_ECHO_GUARD_MS = 700U;         // Microfone "surdo" após o Bicho falar (o fim da reprodução já tem +350 ms de margem)
+constexpr uint32_t VAD_END_SILENCE_MS = 750U;        // Pausa que encerra a frase
+constexpr uint32_t VAD_WAKE_PAUSE_MS = 1800U;        // Após um trecho curto ("Ei Bicho!") espera mais pela pergunta
+constexpr uint32_t VAD_SHORT_PHRASE_VOICED_MS = 1300U; // Até quanto de voz um trecho conta como "só o chamado"
+constexpr uint32_t VAD_MIN_VOICED_MS = 350U;         // Voz mínima acumulada para considerar frase (descarta estalos)
+constexpr uint32_t VAD_MAX_PHRASE_MS = 11000U;       // Frases mais longas viram conversa/reunião e são descartadas
+constexpr uint32_t VAD_PREROLL_MS = 700U;            // Margem antes do início detectado (cobre fala iniciada durante a guarda anti-eco)
+constexpr uint32_t VAD_RETRIGGER_COOLDOWN_MS = 2500U;// Intervalo mínimo entre duas frases enviadas ao Oráculo
+constexpr float VAD_START_MARGIN_DB = 10.5f;         // Início da frase: piso de ruído + margem
+constexpr float VAD_CONTINUE_MARGIN_DB = 6.0f;       // Histerese: dentro da frase basta piso + margem menor
 constexpr size_t MAX_VOICE_NOTES_FILES = 20; // Limite máximo de notas de voz arquivadas em sd_card/voice_notes/
 
 // Caminhos de arquivos temporários para Webcam e Persistência
@@ -48,6 +61,7 @@ constexpr const char* CAM_PIP_HD_FILE_PATH = "cam_pip_hd.raw";
 constexpr const char* CAM_PIP_RGB565_FILE_PATH = "cam_pip_rgb565.raw";
 constexpr const char* CAM_PIP_HD_RGB565_FILE_PATH = "cam_pip_hd_rgb565.raw";
 constexpr const char* SD_CONFIG_FILE_PATH = "sd_card/config.json";
+constexpr const char* LOCAL_TIMEZONE_POSIX = "<-03>3"; // America/Sao_Paulo (UTC-3, sem horário de verão)
 
 // Dimensões do Visor Tático Picture-in-Picture (PIP 64x48 padrão e 160x120 Zoom HD)
 constexpr int32_t PIP_FRAME_WIDTH = 64;
@@ -228,10 +242,35 @@ private:
 
     void updateSharedVisionCalibrationAndGestures(uint32_t now_ms, bool raw_slouch_hint, bool raw_close_hint);
 
+    // Sincronização entre a task de percepção (Core 0 no ESP32-S3) e o loop de renderização (Core 1).
+    // updateSensors() escreve no estado de trabalho sob sensor_mutex; latchFrameSnapshot() publica
+    // uma cópia consistente (front buffers) que os getters devolvem ao loop principal.
+    mutable std::recursive_mutex sensor_mutex;
+    GazeTargetData front_gaze_data;
+    AudioSensorData front_audio_data;
+    EnvironmentSensorData front_env_data;
+    AudioSensorData pending_audio_events;   // Eventos one-shot acumulados entre dois latches
+    bool pending_hand_wave;
+    uint32_t pip_generation;                // Incrementado a cada novo quadro PIP escrito
+    uint32_t front_pip_generation;
+    std::vector<uint8_t> front_pip_gray;
+    std::vector<uint8_t> front_pip_hd_gray;
+    std::vector<uint16_t> front_pip_rgb565;
+    std::vector<uint16_t> front_pip_hd_rgb565;
+    bool front_has_valid_pip_frame;
+    bool front_has_valid_pip_hd_frame;
+    bool front_has_valid_pip_rgb565;
+
+    void accumulateOneShotEvents();
+
     // Estado interno do Ouvido 2.0 (DSP Acústico Multiplataforma PC + CoreS3, VAD, Palavra-Chave, Palmas, Assobio e Teclado)
-    uint32_t vad_active_speech_frames;
-    uint32_t vad_trailing_silence_frames;
+    bool vad_in_phrase;
+    uint32_t vad_phrase_start_ms;
+    uint32_t vad_last_voice_ms;
+    uint32_t vad_voiced_ms;
+    uint32_t vad_prev_update_ms;
     uint32_t last_vad_trigger_ms;
+    mutable uint32_t pending_phrase_audio_ms;   // Duração do áudio da última frase (para recortar o WAV enviado)
     uint32_t mic_echo_guard_until_ms;
     float dsp_noise_floor_db;
     float dsp_prev_block_db;
@@ -262,6 +301,10 @@ private:
     uint8_t dsp_beat_streak;
     uint32_t dsp_music_active_until_ms;
 
+    void resetVadPhrase();
+    void resetDspPhraseCounters();
+    void updateVadPhraseStateMachine(uint32_t now_ms, float level_db, float noise_floor_db, float min_start_db,
+                                     bool typing_active, uint16_t voiced_frames, uint8_t syllables, bool wake_latched);
     void analyzeSharedPcmBlockDsp(const int16_t* samples, size_t sample_count, float block_db, double rms_raw, uint32_t now_ms);
 
 #if defined(ARDUINO)
@@ -322,6 +365,18 @@ private:
     uint32_t last_pip_read_ms;
     bool webcam_tracker_active;
 
+    // Ferramentas de diagnóstico do Ouvido no emulador:
+    //   BICHO_TEST_WAV=arquivo.wav (16 kHz, mono, 16 bit) injeta o áudio como se fosse o microfone
+    //   BICHO_TEST_WAV_DELAY_MS=20000 atraso da injeção | BICHO_VAD_DEBUG=1 loga nível/piso do VAD a 10 Hz
+    std::vector<int16_t> test_wav_samples;
+    size_t test_wav_pos;
+    uint32_t test_wav_start_ms;
+    std::atomic<bool> test_wav_injecting;
+    bool vad_debug_log;
+    uint32_t last_vad_debug_ms;
+    void loadTestWavInjection();
+    void feedTestWavInjection(uint32_t now_ms);
+
     static void sdlAudioCaptureCallback(void* userdata, uint8_t* stream, int len);
     void processCapturedAudioSamples(const int16_t* samples, size_t sample_count);
     bool readWebcamTrackerFile(int32_t& out_face_x, int32_t& out_face_y, bool& out_face_detected);
@@ -335,6 +390,12 @@ private:
 
     // Utilitário interno para codificar buffers binários (WAV/JPEG) em Base64
     static std::string encodeBase64(const uint8_t* data, size_t length);
+
+public:
+#if !defined(ARDUINO)
+    // Captura 1 frame da webcam do PC (sem depender do estado da instância; seguro em qualquer thread)
+    static std::string capturePcWebcamJpegBase64();
+#endif
 
 public:
     HalSensors();
@@ -352,6 +413,9 @@ public:
 
     // Atualiza todas as leituras da HAL (deve ser chamado a cada frame)
     void updateSensors();
+
+    // Publica um snapshot consistente dos sensores para o frame atual (chamar no loop de renderização)
+    void latchFrameSnapshot();
     void updatePerceptionSensors();
 
     // Grava 4 segundos das amostras PCM capturadas pelo microfone em WAV e codifica em Base64
@@ -373,18 +437,6 @@ public:
     // Persistência Multiplataforma (Save State: NVS Preferences no ESP32 / pet_save.json no PC)
     bool savePetState(const PersistentPetData& save_data);
     bool loadPetState(PersistentPetData& out_save_data);
-
-    // Cliente HTTP / IA Abstraído (WiFiClientSecure + HTTPClient + ArduinoJson no ESP32 / Mock ou Script no PC)
-    bool requestOracleInference(const char* state_json,
-                                char* out_reply_text,
-                                size_t reply_buffer_size,
-                                PetEmotionState& out_target_emotion,
-                                int32_t& out_mood_delta,
-                                int32_t& out_energy_delta,
-                                int32_t* out_hunger_delta = nullptr,
-                                std::string* out_new_memory = nullptr,
-                                std::string* out_permanent_fact = nullptr,
-                                std::string* out_memory_tags = nullptr);
 
     // Getters de leitura rápida (camelCase)
     const GazeTargetData& getGazeData() const;

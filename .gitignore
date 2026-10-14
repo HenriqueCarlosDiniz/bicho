@@ -21,6 +21,9 @@ temp_mic_rec.wav
 temp_world_http.json
 gemini_req.json
 gemini_resp.json
+gemini_tts_req.json
+gemini_tts_resp.json
+gemini_auth_headers.txt
 cam_snap.jpg
 cam_snap_tmp.jpg
 face_track.txt

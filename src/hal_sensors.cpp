@@ -1,4 +1,6 @@
 #include "hal_sensors.h"
+#include "world_context.h"
+#include "pc_process.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -10,9 +12,7 @@
 #include <dirent.h>
 #endif
 
-#if __has_include(<ArduinoJson.h>)
 #include <ArduinoJson.h>
-#endif
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -23,8 +23,7 @@
 #if defined(ARDUINO)
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <time.h>
 #if __has_include(<esp_camera.h>)
 #include <esp_camera.h>
 #include <img_converters.h>
@@ -83,9 +82,13 @@ HalSensors::HalSensors()
       thumb_active_until_ms(0),
       victory_active_until_ms(0),
       palm_active_until_ms(0),
-      vad_active_speech_frames(0),
-      vad_trailing_silence_frames(0),
+      vad_in_phrase(false),
+      vad_phrase_start_ms(0),
+      vad_last_voice_ms(0),
+      vad_voiced_ms(0),
+      vad_prev_update_ms(0),
       last_vad_trigger_ms(0),
+      pending_phrase_audio_ms(0),
       mic_echo_guard_until_ms(0),
       dsp_noise_floor_db(32.0f),
       dsp_prev_block_db(NOISE_FLOOR_DB),
@@ -160,7 +163,12 @@ HalSensors::HalSensors()
       silence_voice_frames(0),
       last_face_track_check_ms(0),
       last_pip_read_ms(0),
-      webcam_tracker_active(false)
+      webcam_tracker_active(false),
+      test_wav_pos(0),
+      test_wav_start_ms(0),
+      test_wav_injecting(false),
+      vad_debug_log(false),
+      last_vad_debug_ms(0)
 #endif
     , debug_mode_enabled(false)
 {
@@ -196,8 +204,8 @@ HalSensors::HalSensors()
     std::snprintf(sd_config.wifi_ssid, sizeof(sd_config.wifi_ssid), "%s", WIFI_SSID);
     std::snprintf(sd_config.wifi_password, sizeof(sd_config.wifi_password), "%s", WIFI_PASSWORD);
     std::snprintf(sd_config.gemini_api_key, sizeof(sd_config.gemini_api_key), "%s", AI_API_KEY);
-    sd_config.latitude = -23.5505f;
-    sd_config.longitude = -46.6333f;
+    sd_config.latitude = DEFAULT_LOCATION_LATITUDE;
+    sd_config.longitude = DEFAULT_LOCATION_LONGITUDE;
     sd_config.time_scale = 1.0f;
     sd_config.speaker_volume = 175;
     sd_config.morning_briefing_enabled = true;
@@ -210,6 +218,22 @@ HalSensors::HalSensors()
 #if defined(ARDUINO)
     std::memset(prev_cores3_luma_grid, 128, sizeof(prev_cores3_luma_grid));
 #endif
+
+    // Front buffers publicados ao loop de renderização (alocados no heap -> PSRAM no CoreS3)
+    front_gaze_data = gaze_data;
+    front_audio_data = audio_data;
+    front_env_data = env_data;
+    std::memset(&pending_audio_events, 0, sizeof(pending_audio_events));
+    pending_hand_wave = false;
+    pip_generation = 0;
+    front_pip_generation = 0;
+    front_pip_gray.assign(PIP_FRAME_BYTES, 0);
+    front_pip_hd_gray.assign(PIP_HD_FRAME_BYTES, 0);
+    front_pip_rgb565.assign(PIP_FRAME_BYTES, 0);
+    front_pip_hd_rgb565.assign(PIP_HD_FRAME_BYTES, 0);
+    front_has_valid_pip_frame = false;
+    front_has_valid_pip_hd_frame = false;
+    front_has_valid_pip_rgb565 = false;
 }
 
 HalSensors::~HalSensors() {
@@ -238,92 +262,56 @@ bool HalSensors::loadOrInitSdConfig() {
 #endif
         FILE* wf = std::fopen(SD_CONFIG_FILE_PATH, "w");
         if (wf != nullptr) {
-            std::fprintf(
-                wf,
-                "{\n"
-                "  \"wifi_ssid\": \"%s\",\n"
-                "  \"wifi_password\": \"%s\",\n"
-                "  \"gemini_api_key\": \"\",\n"
-                "  \"latitude\": %.4f,\n"
-                "  \"longitude\": %.4f,\n"
-                "  \"time_scale\": %.1f,\n"
-                "  \"speaker_volume\": %u,\n"
-                "  \"morning_briefing_enabled\": %s\n"
-                "}\n",
-                sd_config.wifi_ssid,
-                sd_config.wifi_password,
-                sd_config.latitude,
-                sd_config.longitude,
-                sd_config.time_scale,
-                static_cast<unsigned int>(sd_config.speaker_volume),
-                sd_config.morning_briefing_enabled ? "true" : "false"
-            );
+            JsonDocument cfg_doc;
+            cfg_doc["wifi_ssid"] = sd_config.wifi_ssid;
+            cfg_doc["wifi_password"] = sd_config.wifi_password;
+            cfg_doc["gemini_api_key"] = "";
+            cfg_doc["latitude"] = sd_config.latitude;
+            cfg_doc["longitude"] = sd_config.longitude;
+            cfg_doc["time_scale"] = sd_config.time_scale;
+            cfg_doc["speaker_volume"] = sd_config.speaker_volume;
+            cfg_doc["morning_briefing_enabled"] = sd_config.morning_briefing_enabled;
+            std::string cfg_text;
+            serializeJsonPretty(cfg_doc, cfg_text);
+            std::fwrite(cfg_text.data(), 1, cfg_text.size(), wf);
             std::fclose(wf);
             M5_LOGI("[SD-CFG] Arquivo padrao '%s' gerado no Cartao SD.", SD_CONFIG_FILE_PATH);
         }
         return true;
     }
 
-    char buf[1024] = {0};
-    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::string cfg_text;
+    char chunk[256];
+    size_t n = 0;
+    while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        cfg_text.append(chunk, n);
+    }
     std::fclose(f);
-    buf[n] = '\0';
 
-    auto extractJsonString = [&](const char* key, char* out_buf, size_t max_len) {
-        const char* pos = std::strstr(buf, key);
-        if (pos == nullptr) return;
-        const char* colon = std::strchr(pos, ':');
-        if (colon == nullptr) return;
-        const char* q1 = std::strchr(colon, '"');
-        if (q1 == nullptr) return;
-        ++q1;
-        const char* q2 = std::strchr(q1, '"');
-        if (q2 == nullptr) return;
-        size_t len = static_cast<size_t>(q2 - q1);
-        if (len == 0) return; // Ignora string vazia para preservar secrets.h caso não preenchido no JSON
-        if (len >= max_len) len = max_len - 1;
-        std::memcpy(out_buf, q1, len);
-        out_buf[len] = '\0';
+    JsonDocument cfg_doc;
+    DeserializationError cfg_err = deserializeJson(cfg_doc, cfg_text);
+    if (cfg_err != DeserializationError::Ok) {
+        M5_LOGW("[SD-CFG] '%s' invalido (%s); mantendo valores de secrets.h.", SD_CONFIG_FILE_PATH, cfg_err.c_str());
+        return false;
+    }
+
+    // Strings vazias no JSON preservam os valores de secrets.h
+    auto copyNonEmpty = [&cfg_doc](const char* key, char* out_buf, size_t max_len) {
+        const char* val = cfg_doc[key] | "";
+        if (val[0] != '\0') {
+            std::snprintf(out_buf, max_len, "%s", val);
+        }
     };
+    copyNonEmpty("wifi_ssid", sd_config.wifi_ssid, sizeof(sd_config.wifi_ssid));
+    copyNonEmpty("wifi_password", sd_config.wifi_password, sizeof(sd_config.wifi_password));
+    copyNonEmpty("gemini_api_key", sd_config.gemini_api_key, sizeof(sd_config.gemini_api_key));
 
-    extractJsonString("\"wifi_ssid\"", sd_config.wifi_ssid, sizeof(sd_config.wifi_ssid));
-    extractJsonString("\"wifi_password\"", sd_config.wifi_password, sizeof(sd_config.wifi_password));
-    extractJsonString("\"gemini_api_key\"", sd_config.gemini_api_key, sizeof(sd_config.gemini_api_key));
-
-    const char* lat_pos = std::strstr(buf, "\"latitude\"");
-    if (lat_pos != nullptr) {
-        const char* c = std::strchr(lat_pos, ':');
-        if (c != nullptr) std::sscanf(c + 1, "%f", &sd_config.latitude);
-    }
-    const char* lon_pos = std::strstr(buf, "\"longitude\"");
-    if (lon_pos != nullptr) {
-        const char* c = std::strchr(lon_pos, ':');
-        if (c != nullptr) std::sscanf(c + 1, "%f", &sd_config.longitude);
-    }
-    const char* ts_pos = std::strstr(buf, "\"time_scale\"");
-    if (ts_pos != nullptr) {
-        const char* c = std::strchr(ts_pos, ':');
-        if (c != nullptr) std::sscanf(c + 1, "%f", &sd_config.time_scale);
-    }
-    const char* vol_pos = std::strstr(buf, "\"speaker_volume\"");
-    if (vol_pos != nullptr) {
-        const char* c = std::strchr(vol_pos, ':');
-        int v = 175;
-        if (c != nullptr && std::sscanf(c + 1, "%d", &v) == 1) {
-            if (v < 0) v = 0;
-            if (v > 255) v = 255;
-            sd_config.speaker_volume = static_cast<uint8_t>(v);
-        }
-    }
-    const char* mb_pos = std::strstr(buf, "\"morning_briefing_enabled\"");
-    if (mb_pos != nullptr) {
-        const char* c = std::strchr(mb_pos, ':');
-        if (c != nullptr) {
-            sd_config.morning_briefing_enabled = (std::strstr(c + 1, "false") == nullptr ||
-                                                  (std::strstr(c + 1, "true") != nullptr &&
-                                                   std::strstr(c + 1, "true") < std::strstr(c + 1, "false")));
-        }
-    }
+    sd_config.latitude = cfg_doc["latitude"] | sd_config.latitude;
+    sd_config.longitude = cfg_doc["longitude"] | sd_config.longitude;
+    sd_config.time_scale = cfg_doc["time_scale"] | sd_config.time_scale;
+    int volume = cfg_doc["speaker_volume"] | static_cast<int>(sd_config.speaker_volume);
+    sd_config.speaker_volume = static_cast<uint8_t>(volume < 0 ? 0 : (volume > 255 ? 255 : volume));
+    sd_config.morning_briefing_enabled = cfg_doc["morning_briefing_enabled"] | sd_config.morning_briefing_enabled;
 
     M5_LOGI("[SD-CFG] Configuracao carregada de '%s' (Lat=%.2f, Lon=%.2f, Vol=%u, Briefing=%s)",
             SD_CONFIG_FILE_PATH,
@@ -344,6 +332,9 @@ bool HalSensors::initHardware() {
     initCoreS3Peripherals();
 #else
     M5_LOGI("[HAL-PC] Simulador Desktop SDL2 inicializado.");
+    const char* vad_debug_env = std::getenv("BICHO_VAD_DEBUG");
+    vad_debug_log = (vad_debug_env != nullptr && vad_debug_env[0] == '1');
+    loadTestWavInjection();
     M5_LOGI("[HAL-PC] Controles: RPG [TAB] | Chuva [W] | Gestos: Shhh [Q] Joinha [J] Selfie [K] Palma [H] | Postura [C] | Óptica PIP [X] | Objeto [S] | Tema [T] | Zoom [Z] | Voz [V] | Pomodoro [F] | Timelapse [G] | Som [B] | Nota [N] | Debug [D]");
 
     // Se o script de rastreamento facial da webcam não estiver rodando ainda, inicia automaticamente em background
@@ -353,11 +344,15 @@ bool HalSensors::initHardware() {
                                     std::fabs(std::difftime(now_epoch, track_stat.st_mtime)) <= 3.5);
     if (!tracker_already_running) {
 #if defined(_WIN32)
-        std::system("start \"\" /B python scripts/webcam_tracker.py >nul 2>&1");
+        bool tracker_started = spawnBackgroundChildProcess("python scripts/webcam_tracker.py");
 #else
-        std::system("python3 scripts/webcam_tracker.py >/dev/null 2>&1 &");
+        bool tracker_started = spawnBackgroundChildProcess("python3 scripts/webcam_tracker.py");
 #endif
-        M5_LOGI("[HAL-PC] Processo background 'scripts/webcam_tracker.py' (YuNet ONNX Visao 2.0 + Gestos) disparado.");
+        if (tracker_started) {
+            M5_LOGI("[HAL-PC] Processo background 'scripts/webcam_tracker.py' (YuNet ONNX Visao 2.0 + Gestos) disparado (encerra junto com o emulador).");
+        } else {
+            M5_LOGW("[HAL-PC] Nao foi possivel iniciar 'scripts/webcam_tracker.py' (python no PATH?).");
+        }
     }
 
 #if __has_include(<SDL2/SDL.h>) || __has_include(<SDL.h>)
@@ -402,6 +397,7 @@ bool HalSensors::initHardware() {
 }
 
 void HalSensors::recalibratePostureBaseline() {
+    std::lock_guard<std::recursive_mutex> lock(sensor_mutex);
     if (gaze_data.face_detected) {
         calibrated_face_y = static_cast<float>(gaze_data.raw_screen_y);
         calibrated_face_w = (gaze_data.face_width_px > 20) ? static_cast<float>(gaze_data.face_width_px) : 62.0f;
@@ -660,7 +656,115 @@ void HalSensors::analyzeSharedPcmBlockDsp(const int16_t* samples,
     dsp_prev_zcr = zcr;
 }
 
+void HalSensors::resetVadPhrase() {
+    vad_in_phrase = false;
+    vad_phrase_start_ms = 0;
+    vad_last_voice_ms = 0;
+    vad_voiced_ms = 0;
+    audio_data.vad_speech_active = false;
+}
+
+void HalSensors::resetDspPhraseCounters() {
+#if !defined(ARDUINO)
+    std::lock_guard<std::mutex> lock(mic_buffer_mutex); // Contadores escritos pelo callback de áudio do SDL
+#endif
+    dsp_kw_phonetic_stage = 0;
+    dsp_voiced_formant_frames = 0;
+    dsp_syllable_peaks = 0;
+    dsp_wake_word_latched = false;
+}
+
+// VAD por tempo (independente do FPS): início com limiar alto, continuação com limiar mais baixo (histerese),
+// fim após VAD_END_SILENCE_MS de pausa. Frases muito curtas (estalos) ou longas demais (conversa) são descartadas.
+void HalSensors::updateVadPhraseStateMachine(uint32_t now_ms, float level_db, float noise_floor_db, float min_start_db,
+                                             bool typing_active, uint16_t voiced_frames, uint8_t syllables,
+                                             bool wake_latched) {
+    uint32_t dt_ms = (vad_prev_update_ms == 0U) ? 0U : (now_ms - vad_prev_update_ms);
+    if (dt_ms > 100U) {
+        dt_ms = 100U;
+    }
+    vad_prev_update_ms = now_ms;
+
+    const float start_thresh_db = fmaxf(min_start_db, noise_floor_db + VAD_START_MARGIN_DB);
+    const float continue_thresh_db = fmaxf(min_start_db - 4.0f, noise_floor_db + VAD_CONTINUE_MARGIN_DB);
+    const float thresh_db = vad_in_phrase ? continue_thresh_db : start_thresh_db;
+    const bool voice_now = (level_db >= thresh_db && level_db < 84.0f) &&
+                           (!typing_active || voiced_frames >= 6U);
+
+    if (!vad_in_phrase) {
+        if (!voice_now) {
+            return;
+        }
+        vad_in_phrase = true;
+        vad_phrase_start_ms = now_ms;
+        vad_last_voice_ms = now_ms;
+        vad_voiced_ms = dt_ms;
+        return;
+    }
+
+    if (voice_now) {
+        vad_last_voice_ms = now_ms;
+        vad_voiced_ms += dt_ms;
+    }
+    audio_data.vad_speech_active = (vad_voiced_ms >= VAD_MIN_VOICED_MS);
+
+    const uint32_t phrase_ms = now_ms - vad_phrase_start_ms;
+    if (phrase_ms > VAD_MAX_PHRASE_MS) {
+        M5_LOGI("[OUVIDO-VAD] Fala com mais de %u ms descartada (conversa longa / reuniao).",
+                static_cast<unsigned int>(VAD_MAX_PHRASE_MS));
+        resetVadPhrase();
+        resetDspPhraseCounters();
+        return;
+    }
+    // "Ei Bicho! ... [pausa] ... que horas são?": depois de um trecho curto, a pausa tolerada é maior
+    const uint32_t end_silence_ms = (vad_voiced_ms < VAD_SHORT_PHRASE_VOICED_MS) ? VAD_WAKE_PAUSE_MS : VAD_END_SILENCE_MS;
+    if (now_ms - vad_last_voice_ms < end_silence_ms) {
+        return; // Ainda dentro da frase (pausa entre palavras)
+    }
+
+    // Frase encerrada
+    const uint32_t voiced_ms = vad_voiced_ms;
+    const uint32_t audio_ms = phrase_ms + VAD_PREROLL_MS;
+    resetVadPhrase();
+
+    if (voiced_ms < VAD_MIN_VOICED_MS) {
+        resetDspPhraseCounters();
+        return;
+    }
+    if (now_ms - last_vad_trigger_ms < VAD_RETRIGGER_COOLDOWN_MS) {
+        M5_LOGI("[OUVIDO-VAD] Frase ignorada: muito proxima da anterior (%u ms).",
+                static_cast<unsigned int>(now_ms - last_vad_trigger_ms));
+        resetDspPhraseCounters();
+        return;
+    }
+
+    const bool facing_bicho = gaze_data.face_detected && (std::fabs(gaze_data.head_yaw_deg) <= 24.0f);
+    const bool kw_ok = !audio_data.vad_keyword_mode ||
+                       wake_latched ||
+                       (facing_bicho && syllables >= 2U);
+    audio_data.wake_word_detected = wake_latched || (facing_bicho && syllables >= 2U);
+
+    if (kw_ok) {
+        audio_data.vad_phrase_completed = true;
+        audio_data.last_event = AUDIO_EVENT_VOICE_COMMAND;
+        last_vad_trigger_ms = now_ms;
+        pending_phrase_audio_ms = audio_ms;
+        M5_LOGI("[OUVIDO-VAD] Frase detectada (%s, voz=%u ms, audio=%u ms, silabas=%u). Acionando Oraculo...",
+                wake_latched ? "FONETICA_BICHO" : (audio_data.vad_keyword_mode ? "ENCARANDO_BICHO" : "LIVRE"),
+                static_cast<unsigned int>(voiced_ms),
+                static_cast<unsigned int>(audio_ms),
+                static_cast<unsigned int>(syllables));
+    } else {
+        M5_LOGI("[OUVIDO-VAD] Fala lateral ignorada (sem palavra-chave e sem olhar para o Bicho: voz=%u ms, silabas=%u, yaw=%.1f).",
+                static_cast<unsigned int>(voiced_ms),
+                static_cast<unsigned int>(syllables),
+                gaze_data.head_yaw_deg);
+    }
+    resetDspPhraseCounters();
+}
+
 void HalSensors::updateSensors() {
+    std::lock_guard<std::recursive_mutex> lock(sensor_mutex);
 #if defined(ARDUINO)
     readCoreS3CameraGaze();
     readCoreS3Microphone();
@@ -670,6 +774,73 @@ void HalSensors::updateSensors() {
     readPcSimulatedAudio();
     readPcSimulatedEnvironment();
 #endif
+    accumulateOneShotEvents();
+}
+
+// Guarda os gatilhos de um único ciclo para que não se percam caso a task de percepção
+// rode mais de uma vez entre dois frames de renderização (ESP32-S3 dual-core).
+void HalSensors::accumulateOneShotEvents() {
+    AudioSensorData& pend = pending_audio_events;
+    const AudioSensorData& cur = audio_data;
+    pend.is_loud_peak |= cur.is_loud_peak;
+    pend.interaction_triggered |= cur.interaction_triggered;
+    pend.vad_phrase_completed |= cur.vad_phrase_completed;
+    pend.double_clap_detected |= cur.double_clap_detected;
+    pend.whistle_detected |= cur.whistle_detected;
+    pend.silence_toggle_kbd_triggered |= cur.silence_toggle_kbd_triggered;
+    pend.pomodoro_toggle_triggered |= cur.pomodoro_toggle_triggered;
+    pend.gallery_timelapse_triggered |= cur.gallery_timelapse_triggered;
+    pend.ambient_audio_toggle_triggered |= cur.ambient_audio_toggle_triggered;
+    pend.voice_note_replay_triggered |= cur.voice_note_replay_triggered;
+    pend.theme_cycle_triggered |= cur.theme_cycle_triggered;
+    pend.pip_zoom_toggle_triggered |= cur.pip_zoom_toggle_triggered;
+    pend.rpg_modal_toggle_triggered |= cur.rpg_modal_toggle_triggered;
+    pend.calibrate_posture_triggered |= cur.calibrate_posture_triggered;
+    pend.pip_color_mode_triggered |= cur.pip_color_mode_triggered;
+    pend.object_scan_triggered |= cur.object_scan_triggered;
+    pend.rain_preview_toggle_triggered |= cur.rain_preview_toggle_triggered;
+    pending_hand_wave |= gaze_data.hand_wave_detected;
+}
+
+void HalSensors::latchFrameSnapshot() {
+    std::lock_guard<std::recursive_mutex> lock(sensor_mutex);
+    front_gaze_data = gaze_data;
+    front_audio_data = audio_data;
+    front_env_data = env_data;
+
+    AudioSensorData& out = front_audio_data;
+    const AudioSensorData& pend = pending_audio_events;
+    out.is_loud_peak |= pend.is_loud_peak;
+    out.interaction_triggered |= pend.interaction_triggered;
+    out.vad_phrase_completed |= pend.vad_phrase_completed;
+    out.double_clap_detected |= pend.double_clap_detected;
+    out.whistle_detected |= pend.whistle_detected;
+    out.silence_toggle_kbd_triggered |= pend.silence_toggle_kbd_triggered;
+    out.pomodoro_toggle_triggered |= pend.pomodoro_toggle_triggered;
+    out.gallery_timelapse_triggered |= pend.gallery_timelapse_triggered;
+    out.ambient_audio_toggle_triggered |= pend.ambient_audio_toggle_triggered;
+    out.voice_note_replay_triggered |= pend.voice_note_replay_triggered;
+    out.theme_cycle_triggered |= pend.theme_cycle_triggered;
+    out.pip_zoom_toggle_triggered |= pend.pip_zoom_toggle_triggered;
+    out.rpg_modal_toggle_triggered |= pend.rpg_modal_toggle_triggered;
+    out.calibrate_posture_triggered |= pend.calibrate_posture_triggered;
+    out.pip_color_mode_triggered |= pend.pip_color_mode_triggered;
+    out.object_scan_triggered |= pend.object_scan_triggered;
+    out.rain_preview_toggle_triggered |= pend.rain_preview_toggle_triggered;
+    front_gaze_data.hand_wave_detected |= pending_hand_wave;
+    std::memset(&pending_audio_events, 0, sizeof(pending_audio_events));
+    pending_hand_wave = false;
+
+    if (front_pip_generation != pip_generation) {
+        front_pip_generation = pip_generation;
+        std::memcpy(front_pip_gray.data(), pip_frame_gray, PIP_FRAME_BYTES);
+        std::memcpy(front_pip_hd_gray.data(), pip_hd_frame_gray, PIP_HD_FRAME_BYTES);
+        std::memcpy(front_pip_rgb565.data(), pip_frame_rgb565, PIP_FRAME_BYTES * sizeof(uint16_t));
+        std::memcpy(front_pip_hd_rgb565.data(), pip_hd_frame_rgb565, PIP_HD_FRAME_BYTES * sizeof(uint16_t));
+        front_has_valid_pip_frame = has_valid_pip_frame;
+        front_has_valid_pip_hd_frame = has_valid_pip_hd_frame;
+        front_has_valid_pip_rgb565 = has_valid_pip_rgb565;
+    }
 }
 
 void HalSensors::updatePerceptionSensors() {
@@ -677,6 +848,15 @@ void HalSensors::updatePerceptionSensors() {
 }
 
 void HalSensors::switchAudioBusMode(AudioModeState desired_mode) {
+    // O barramento I2S é compartilhado com a leitura do microfone feita pela task de percepção
+    std::lock_guard<std::recursive_mutex> lock(sensor_mutex);
+#if !defined(ARDUINO)
+    if (vad_debug_log) {
+        M5_LOGI("[VAD-DEBUG] Barramento de audio: %s -> %s",
+                current_audio_mode == AUDIO_MODE_MIC ? "MIC" : "SPEAKER",
+                desired_mode == AUDIO_MODE_MIC ? "MIC" : "SPEAKER");
+    }
+#endif
     if (current_audio_mode == desired_mode) {
         return;
     }
@@ -707,13 +887,11 @@ void HalSensors::switchAudioBusMode(AudioModeState desired_mode) {
     }
 #endif
 
-    // Proteção anti-eco: bloqueia o microfone por 2.5 segundos após o término da fala do próprio Bicho
-    // para que ele jamais ouça a própria voz saindo da caixa de som e entre em loop!
-    vad_active_speech_frames = 0;
-    vad_trailing_silence_frames = 0;
-    audio_data.vad_speech_active = false;
+    // Proteção anti-eco: o VAD ignora o microfone por MIC_ECHO_GUARD_MS após o Bicho falar, para não ouvir
+    // a própria voz. Era 2.5 s, o que cortava o início da resposta de quem fala logo em seguida.
+    resetVadPhrase();
     audio_data.vad_phrase_completed = false;
-    mic_echo_guard_until_ms = M5.millis() + 2500U;
+    mic_echo_guard_until_ms = M5.millis() + MIC_ECHO_GUARD_MS;
 
     current_audio_mode = desired_mode;
 }
@@ -721,6 +899,9 @@ void HalSensors::switchAudioBusMode(AudioModeState desired_mode) {
 std::string HalSensors::recordUserAudioWav() const {
     std::vector<int16_t> pcm_samples;
 #if defined(ARDUINO)
+    std::unique_lock<std::recursive_mutex> ring_lock(sensor_mutex);
+    const uint32_t phrase_audio_ms = pending_phrase_audio_ms; // Escrito pela task de percepção
+    pending_phrase_audio_ms = 0U;
     size_t total_available = cores3_mic_filled ? MIC_RING_BUFFER_SAMPLES : cores3_mic_write_pos;
     if (total_available < (MIC_CAPTURE_SAMPLE_RATE / 2U)) {
         return "";
@@ -737,7 +918,10 @@ std::string HalSensors::recordUserAudioWav() const {
     }
     cores3_mic_write_pos = 0;
     cores3_mic_filled = false;
+    ring_lock.unlock();
 #else
+    const uint32_t phrase_audio_ms = pending_phrase_audio_ms;
+    pending_phrase_audio_ms = 0U;
     if (!mic_capture_active) {
         return "";
     }
@@ -774,6 +958,20 @@ std::string HalSensors::recordUserAudioWav() const {
         mic_ring_filled = false;
     }
 #endif
+
+    // 1b. Envia só a última frase detectada pelo VAD (+ pre-roll), para o "Ei Bicho" do início não ficar de fora
+    //     nem o Gemini receber segundos de silêncio/ruído antigos
+    if (phrase_audio_ms > 0U) {
+        size_t phrase_samples = static_cast<size_t>(
+            (static_cast<uint64_t>(phrase_audio_ms) * MIC_CAPTURE_SAMPLE_RATE) / 1000ULL);
+        if (phrase_samples > 0U && phrase_samples < pcm_samples.size()) {
+            pcm_samples.erase(pcm_samples.begin(),
+                              pcm_samples.begin() + static_cast<std::ptrdiff_t>(pcm_samples.size() - phrase_samples));
+        }
+    }
+    if (pcm_samples.empty()) {
+        return "";
+    }
 
     // 2. Monta o cabeçalho padrão RIFF/WAVE de 44 bytes (16kHz, 16-bit PCM, Mono) em memória
     const uint32_t data_chunk_bytes = static_cast<uint32_t>(pcm_samples.size() * sizeof(int16_t));
@@ -878,6 +1076,7 @@ std::string HalSensors::recordUserAudioWav() const {
 std::string HalSensors::captureCameraJpegBase64() const {
 #if defined(ARDUINO)
 #if __has_include(<esp_camera.h>)
+    std::unique_lock<std::recursive_mutex> cam_lock(sensor_mutex);
     if (cores3_camera_initialized) {
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb != nullptr) {
@@ -904,6 +1103,7 @@ std::string HalSensors::captureCameraJpegBase64() const {
             esp_camera_fb_return(fb);
         }
     }
+    cam_lock.unlock();
 #endif
     // Fallback em caso de snapshot prévio salvo no SD do CoreS3
     FILE* f = std::fopen(CAM_SNAP_FILE_PATH, "rb");
@@ -924,6 +1124,12 @@ std::string HalSensors::captureCameraJpegBase64() const {
     }
     return "";
 #else
+    return capturePcWebcamJpegBase64();
+#endif
+}
+
+#if !defined(ARDUINO)
+std::string HalSensors::capturePcWebcamJpegBase64() {
     // 1. Verifica se 'cam_snap.jpg' já foi atualizado recentemente pelo script 'scripts/webcam_tracker.py'
     bool has_fresh_snapshot = false;
     struct stat file_stat;
@@ -989,10 +1195,11 @@ std::string HalSensors::captureCameraJpegBase64() const {
             static_cast<unsigned int>(jpg_bytes.size()));
 
     return encodeBase64(jpg_bytes.data(), jpg_bytes.size());
-#endif
 }
+#endif
 
 void HalSensors::setFacePresence(bool is_present) {
+    std::lock_guard<std::recursive_mutex> lock(sensor_mutex);
     gaze_data.face_detected = is_present;
 #if !defined(ARDUINO)
     simulated_presence_enabled = is_present;
@@ -1072,7 +1279,6 @@ bool HalSensors::loadPetState(PersistentPetData& out_save_data) {
     unsigned int focus_v = 0;
     bool any_field_found = false;
 
-#if __has_include(<ArduinoJson.h>)
     JsonDocument save_doc;
     if (deserializeJson(save_doc, file_buffer) == DeserializationError::Ok) {
         if (save_doc["hunger_level"].is<int>()) {
@@ -1092,30 +1298,6 @@ bool HalSensors::loadPetState(PersistentPetData& out_save_data) {
             any_field_found = true;
         }
     }
-#endif
-
-    // Parser resiliente por chave individual (independente da ordem das chaves no JSON)
-    if (!any_field_found) {
-        auto extractIntByKey = [&](const char* key_name, int& out_val) -> bool {
-            const char* key_pos = std::strstr(file_buffer, key_name);
-            if (key_pos == nullptr) return false;
-            const char* colon_pos = std::strchr(key_pos, ':');
-            if (colon_pos == nullptr) return false;
-            return (std::sscanf(colon_pos + 1, "%d", &out_val) == 1);
-        };
-        auto extractUIntByKey = [&](const char* key_name, unsigned int& out_val) -> bool {
-            const char* key_pos = std::strstr(file_buffer, key_name);
-            if (key_pos == nullptr) return false;
-            const char* colon_pos = std::strchr(key_pos, ':');
-            if (colon_pos == nullptr) return false;
-            return (std::sscanf(colon_pos + 1, "%u", &out_val) == 1);
-        };
-
-        if (extractIntByKey("\"hunger_level\"", hunger_v))   any_field_found = true;
-        if (extractIntByKey("\"mood_score\"", mood_v))       any_field_found = true;
-        if (extractIntByKey("\"energy_level\"", energy_v))   any_field_found = true;
-        if (extractUIntByKey("\"focus_minutes\"", focus_v))  any_field_found = true;
-    }
 
     if (any_field_found) {
         out_save_data.hunger_level  = hunger_v;
@@ -1130,114 +1312,16 @@ bool HalSensors::loadPetState(PersistentPetData& out_save_data) {
 #endif
 }
 
-bool HalSensors::requestOracleInference(const char* state_json,
-                                        char* out_reply_text,
-                                        size_t reply_buffer_size,
-                                        PetEmotionState& out_target_emotion,
-                                        int32_t& out_mood_delta,
-                                        int32_t& out_energy_delta,
-                                        int32_t* out_hunger_delta,
-                                        std::string* out_new_memory,
-                                        std::string* out_permanent_fact,
-                                        std::string* out_memory_tags) {
-#if defined(ARDUINO)
-    // Prioriza sd_config.gemini_api_key (sd_card/config.json), com fallback para AI_API_KEY (secrets.h)
-    const char* active_api_key = (std::strlen(sd_config.gemini_api_key) > 10 &&
-                                  std::strcmp(sd_config.gemini_api_key, "SUA_CHAVE_DE_API_MULTIMODAL_AQUI") != 0)
-                                     ? sd_config.gemini_api_key
-                                     : AI_API_KEY;
-
-    // No M5Stack CoreS3: utiliza WiFiClientSecure + HTTPClient + ArduinoJson se o Wi-Fi estiver conectado
-    if (WiFi.status() == WL_CONNECTED && active_api_key != nullptr &&
-        std::strlen(active_api_key) > 10 &&
-        std::strcmp(active_api_key, "SUA_CHAVE_DE_API_MULTIMODAL_AQUI") != 0) {
-        WiFiClientSecure secure_client;
-        secure_client.setInsecure();
-        HTTPClient http_client;
-
-        char full_url[256];
-        std::snprintf(full_url, sizeof(full_url), "%s?key=%s", AI_API_ENDPOINT, active_api_key);
-
-        if (http_client.begin(secure_client, full_url)) {
-            http_client.addHeader("Content-Type", "application/json");
-            int http_code = http_client.POST(state_json);
-            if (http_code == HTTP_CODE_OK) {
-#if __has_include(<ArduinoJson.h>)
-                JsonDocument response_doc;
-                DeserializationError err = deserializeJson(response_doc, http_client.getString());
-                if (!err) {
-                    // Extrai primeiro a string JSON interna de candidates[0].content.parts[0].text (padrão generateContent)
-                    JsonDocument inner_doc;
-                    JsonVariantConst payload_obj;
-                    const char* inner_text = response_doc["candidates"][0]["content"]["parts"][0]["text"] | nullptr;
-                    if (inner_text != nullptr && deserializeJson(inner_doc, inner_text) == DeserializationError::Ok) {
-                        payload_obj = inner_doc.as<JsonVariantConst>();
-                    } else {
-                        payload_obj = response_doc.as<JsonVariantConst>();
-                    }
-
-                    if (payload_obj["reply_text"].is<const char*>()) {
-                        std::strncpy(out_reply_text, payload_obj["reply_text"].as<const char*>(), reply_buffer_size - 1);
-                        out_reply_text[reply_buffer_size - 1] = '\0';
-                        out_mood_delta = payload_obj["mood_delta"] | 0;
-                        out_energy_delta = payload_obj["energy_delta"] | 0;
-
-                        int32_t parsed_hunger_delta = payload_obj["hunger_delta"] | 0;
-                        const char* parsed_new_memory = payload_obj["new_memory"] | "";
-                        const char* parsed_perm_fact = payload_obj["permanent_fact"] | "";
-                        const char* parsed_mem_tags = payload_obj["memory_tags"] | "";
-
-                        if (out_hunger_delta != nullptr)   *out_hunger_delta = parsed_hunger_delta;
-                        if (out_new_memory != nullptr)     *out_new_memory = parsed_new_memory;
-                        if (out_permanent_fact != nullptr) *out_permanent_fact = parsed_perm_fact;
-                        if (out_memory_tags != nullptr)    *out_memory_tags = parsed_mem_tags;
-
-                        const char* emo_str = payload_obj["target_emotion"] | "EMOTION_JUDGING";
-                        if (std::strcmp(emo_str, "EMOTION_IDLE") == 0)          out_target_emotion = EMOTION_IDLE;
-                        else if (std::strcmp(emo_str, "EMOTION_FOCUSED") == 0)  out_target_emotion = EMOTION_FOCUSED;
-                        else if (std::strcmp(emo_str, "EMOTION_STARTLED") == 0) out_target_emotion = EMOTION_STARTLED;
-                        else if (std::strcmp(emo_str, "EMOTION_SLEEPING") == 0) out_target_emotion = EMOTION_SLEEPING;
-                        else if (std::strcmp(emo_str, "EMOTION_JUDGING") == 0)  out_target_emotion = EMOTION_JUDGING;
-                        else if (std::strcmp(emo_str, "EMOTION_HAPPY") == 0)    out_target_emotion = EMOTION_HAPPY;
-                        else if (std::strcmp(emo_str, "EMOTION_GRUMPY") == 0)   out_target_emotion = EMOTION_GRUMPY;
-                        else if (std::strcmp(emo_str, "EMOTION_DIZZY") == 0)    out_target_emotion = EMOTION_DIZZY;
-                        else                                                    out_target_emotion = EMOTION_JUDGING;
-
-                        http_client.end();
-                        return true;
-                    }
-                }
-#endif
-            }
-            http_client.end();
-        }
-    }
-    return false;
-#else
-    (void)state_json;
-    (void)out_reply_text;
-    (void)reply_buffer_size;
-    (void)out_target_emotion;
-    (void)out_mood_delta;
-    (void)out_energy_delta;
-    (void)out_hunger_delta;
-    (void)out_new_memory;
-    (void)out_permanent_fact;
-    (void)out_memory_tags;
-    return false;
-#endif
-}
-
 const GazeTargetData& HalSensors::getGazeData() const {
-    return gaze_data;
+    return front_gaze_data;
 }
 
 const AudioSensorData& HalSensors::getAudioData() const {
-    return audio_data;
+    return front_audio_data;
 }
 
 const EnvironmentSensorData& HalSensors::getEnvironmentData() const {
-    return env_data;
+    return front_env_data;
 }
 
 AudioModeState HalSensors::getAudioBusMode() const {
@@ -1245,47 +1329,47 @@ AudioModeState HalSensors::getAudioBusMode() const {
 }
 
 const uint8_t* HalSensors::getPipFrameBuffer() const {
-    return pip_frame_gray;
+    return front_pip_gray.data();
 }
 
 bool HalSensors::hasValidPipFrame() const {
-    return has_valid_pip_frame;
+    return front_has_valid_pip_frame;
 }
 
 const uint8_t* HalSensors::getPipHdFrameBuffer() const {
-    return pip_hd_frame_gray;
+    return front_pip_hd_gray.data();
 }
 
 bool HalSensors::hasValidPipHdFrame() const {
-    return has_valid_pip_hd_frame;
+    return front_has_valid_pip_hd_frame;
 }
 
 const uint16_t* HalSensors::getPipFrameRgb565Buffer() const {
-    return pip_frame_rgb565;
+    return front_pip_rgb565.data();
 }
 
 const uint16_t* HalSensors::getPipHdFrameRgb565Buffer() const {
-    return pip_hd_frame_rgb565;
+    return front_pip_hd_rgb565.data();
 }
 
 bool HalSensors::hasValidPipRgb565Frame() const {
-    return has_valid_pip_rgb565;
+    return front_has_valid_pip_rgb565;
 }
 
 bool HalSensors::isTypingActive() const {
-    return audio_data.is_typing_active;
+    return front_audio_data.is_typing_active;
 }
 
 float HalSensors::getTypingClickRate() const {
-    return audio_data.typing_click_rate;
+    return front_audio_data.typing_click_rate;
 }
 
 bool HalSensors::isMusicActive() const {
-    return audio_data.is_music_active;
+    return front_audio_data.is_music_active;
 }
 
 uint32_t HalSensors::getMusicBeatIntervalMs() const {
-    return (audio_data.music_beat_interval_ms > 150U) ? audio_data.music_beat_interval_ms : 500U;
+    return (front_audio_data.music_beat_interval_ms > 150U) ? front_audio_data.music_beat_interval_ms : 500U;
 }
 
 // =============================================================================
@@ -1368,6 +1452,8 @@ void HalSensors::initCoreS3Peripherals() {
         WiFi.mode(WIFI_STA);
         WiFi.begin(active_wifi_ssid, active_wifi_pass);
         M5_LOGI("[HAL-CORES3] Conectando ao Wi-Fi '%s'...", active_wifi_ssid);
+        // Relógio via NTP (o SNTP tenta de novo sozinho até o Wi-Fi subir): datas de memória/feriados corretas
+        configTzTime(LOCAL_TIMEZONE_POSIX, "pool.ntp.org", "time.google.com");
     }
 }
 
@@ -1434,6 +1520,7 @@ void HalSensors::readCoreS3CameraGaze() {
                 }
             }
             has_valid_pip_hd_frame = true;
+            ++pip_generation;
 
             // 2b. Calcula Mudança de Cena (Scene Change %) e Aceno de Mão Periférico na grade 8x8
             uint32_t diff_acc = 0;
@@ -1601,15 +1688,13 @@ void HalSensors::readCoreS3Microphone() {
 
     int16_t pcm_buf[256];
     if (M5.Mic.record(pcm_buf, 256, MIC_CAPTURE_SAMPLE_RATE)) {
-        // Alimenta o ring buffer de 4s do CoreS3 para envio real de WAV ao Gemini Multimodal
-        if (current_ms >= mic_echo_guard_until_ms) {
-            for (size_t i = 0; i < 256; ++i) {
-                cores3_mic_ring_buffer[cores3_mic_write_pos] = pcm_buf[i];
-                ++cores3_mic_write_pos;
-                if (cores3_mic_write_pos >= MIC_RING_BUFFER_SAMPLES) {
-                    cores3_mic_write_pos = 0;
-                    cores3_mic_filled = true;
-                }
+        // Alimenta o ring buffer do CoreS3 (inclusive durante a guarda anti-eco, para o pre-roll da frase)
+        for (size_t i = 0; i < 256; ++i) {
+            cores3_mic_ring_buffer[cores3_mic_write_pos] = pcm_buf[i];
+            ++cores3_mic_write_pos;
+            if (cores3_mic_write_pos >= MIC_RING_BUFFER_SAMPLES) {
+                cores3_mic_write_pos = 0;
+                cores3_mic_filled = true;
             }
         }
 
@@ -1657,9 +1742,7 @@ void HalSensors::readCoreS3Microphone() {
         if (dsp_double_clap_latched) {
             audio_data.double_clap_detected = true;
             dsp_double_clap_latched = false;
-            vad_active_speech_frames = 0;
-            vad_trailing_silence_frames = 0;
-            audio_data.vad_speech_active = false;
+            resetVadPhrase();
         }
         if (dsp_whistle_latched) {
             audio_data.whistle_detected = true;
@@ -1672,46 +1755,12 @@ void HalSensors::readCoreS3Microphone() {
             last_loud_peak_ms = current_ms;
         }
 
-        const float vad_thresh_db = fmaxf(44.5f, dsp_noise_floor_db + 10.5f);
         if (audio_data.vad_enabled && !audio_data.is_continuous_speech) {
-            bool is_voice_frame = (audio_data.noise_level_db >= vad_thresh_db && audio_data.noise_level_db < 84.0f) &&
-                                  (!audio_data.is_typing_cadence || dsp_voiced_formant_frames >= 6U);
-            if (is_voice_frame) {
-                vad_active_speech_frames++;
-                vad_trailing_silence_frames = 0;
-                if (vad_active_speech_frames >= 18U && vad_active_speech_frames <= 215U) {
-                    audio_data.vad_speech_active = true;
-                }
-            } else if (vad_active_speech_frames >= 20U && vad_active_speech_frames <= 210U) {
-                vad_trailing_silence_frames++;
-                if (vad_trailing_silence_frames >= 45U && (current_ms - last_vad_trigger_ms > 8000U)) {
-                    bool facing_bicho = gaze_data.face_detected && (std::fabs(gaze_data.head_yaw_deg) <= 24.0f);
-                    bool kw_ok = !audio_data.vad_keyword_mode ||
-                                 dsp_wake_word_latched ||
-                                 (facing_bicho && dsp_voiced_formant_frames >= 8U && dsp_syllable_peaks >= 2U);
-                    audio_data.wake_word_detected = dsp_wake_word_latched || (facing_bicho && dsp_syllable_peaks >= 2U);
-                    if (kw_ok && dsp_voiced_formant_frames >= 5U) {
-                        audio_data.vad_phrase_completed = true;
-                        audio_data.vad_speech_active = false;
-                        audio_data.last_event = AUDIO_EVENT_VOICE_COMMAND;
-                        last_vad_trigger_ms = current_ms;
-                    }
-                    vad_active_speech_frames = 0;
-                    vad_trailing_silence_frames = 0;
-                    dsp_kw_phonetic_stage = 0;
-                    dsp_voiced_formant_frames = 0;
-                    dsp_syllable_peaks = 0;
-                    dsp_wake_word_latched = false;
-                }
-            } else {
-                vad_active_speech_frames = 0;
-                vad_trailing_silence_frames = 0;
-                audio_data.vad_speech_active = false;
-                dsp_kw_phonetic_stage = 0;
-                dsp_voiced_formant_frames = 0;
-                dsp_syllable_peaks = 0;
-                dsp_wake_word_latched = false;
-            }
+            updateVadPhraseStateMachine(current_ms, audio_data.noise_level_db, dsp_noise_floor_db, 44.5f,
+                                        audio_data.is_typing_cadence, dsp_voiced_formant_frames,
+                                        dsp_syllable_peaks, dsp_wake_word_latched);
+        } else {
+            resetVadPhrase();
         }
     }
 }
@@ -1809,11 +1858,88 @@ void HalSensors::readCoreS3OnboardSensors() {
 // Implementação Exclusiva para Emulador Desktop PC (SDL2 + Mic Real + Webcam Real)
 // =============================================================================
 
+void HalSensors::loadTestWavInjection() {
+    const char* wav_path = std::getenv("BICHO_TEST_WAV");
+    if (wav_path == nullptr || wav_path[0] == '\0') {
+        return;
+    }
+    std::ifstream wav_file(wav_path, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(wav_file)), std::istreambuf_iterator<char>());
+    if (bytes.size() < 44 || std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
+        M5_LOGW("[TESTE-OUVIDO] BICHO_TEST_WAV invalido: %s", wav_path);
+        return;
+    }
+    auto le16 = [&bytes](size_t o) { return static_cast<uint32_t>(bytes[o] | (bytes[o + 1] << 8)); };
+    auto le32 = [&bytes](size_t o) {
+        return static_cast<uint32_t>(bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (static_cast<uint32_t>(bytes[o + 3]) << 24));
+    };
+    uint32_t channels = 0, rate = 0, bits = 0;
+    size_t pos = 12;
+    while (pos + 8 <= bytes.size()) {
+        uint32_t chunk_size = le32(pos + 4);
+        if (std::memcmp(bytes.data() + pos, "fmt ", 4) == 0 && pos + 24 <= bytes.size()) {
+            channels = le16(pos + 10);
+            rate = le32(pos + 12);
+            bits = le16(pos + 22);
+        } else if (std::memcmp(bytes.data() + pos, "data", 4) == 0) {
+            size_t data_len = std::min<size_t>(chunk_size, bytes.size() - (pos + 8));
+            if (channels != 1 || rate != MIC_CAPTURE_SAMPLE_RATE || bits != 16) {
+                M5_LOGW("[TESTE-OUVIDO] WAV precisa ser 16 kHz mono 16 bit (recebido %u Hz, %u canais, %u bits).",
+                        static_cast<unsigned int>(rate), static_cast<unsigned int>(channels), static_cast<unsigned int>(bits));
+                return;
+            }
+            test_wav_samples.resize(data_len / 2);
+            std::memcpy(test_wav_samples.data(), bytes.data() + pos + 8, test_wav_samples.size() * 2);
+            break;
+        }
+        pos += 8 + chunk_size + (chunk_size & 1U);
+    }
+    if (test_wav_samples.empty()) {
+        return;
+    }
+    const char* delay_env = std::getenv("BICHO_TEST_WAV_DELAY_MS");
+    test_wav_start_ms = M5.millis() + ((delay_env != nullptr) ? static_cast<uint32_t>(std::atoi(delay_env)) : 20000U);
+    M5_LOGI("[TESTE-OUVIDO] WAV de teste carregado (%u ms); injecao em %u ms.",
+            static_cast<unsigned int>(test_wav_samples.size() * 1000U / MIC_CAPTURE_SAMPLE_RATE),
+            static_cast<unsigned int>(test_wav_start_ms));
+}
+
+void HalSensors::feedTestWavInjection(uint32_t now_ms) {
+    if (test_wav_samples.empty() || now_ms < test_wav_start_ms) {
+        return;
+    }
+    // Alimenta o pipeline em tempo real (mesmo ritmo do microfone), incluindo 1.5 s de silêncio no final
+    const size_t silence_tail = MIC_CAPTURE_SAMPLE_RATE * 3U / 2U;
+    const size_t total = test_wav_samples.size() + silence_tail;
+    size_t target = static_cast<size_t>((static_cast<uint64_t>(now_ms - test_wav_start_ms) * MIC_CAPTURE_SAMPLE_RATE) / 1000ULL);
+    if (target > total) {
+        target = total;
+    }
+    test_wav_injecting = true;
+    int16_t chunk[MIC_CAPTURE_BUFFER_FRAMES];
+    while (test_wav_pos + MIC_CAPTURE_BUFFER_FRAMES <= target) {
+        for (size_t i = 0; i < MIC_CAPTURE_BUFFER_FRAMES; ++i) {
+            size_t idx = test_wav_pos + i;
+            chunk[i] = (idx < test_wav_samples.size()) ? test_wav_samples[idx] : 0;
+        }
+        processCapturedAudioSamples(chunk, MIC_CAPTURE_BUFFER_FRAMES);
+        test_wav_pos += MIC_CAPTURE_BUFFER_FRAMES;
+    }
+    if (test_wav_pos + MIC_CAPTURE_BUFFER_FRAMES > total) {
+        M5_LOGI("[TESTE-OUVIDO] Injecao do WAV de teste concluida.");
+        test_wav_samples.clear();
+        test_wav_injecting = false;
+    }
+}
+
 void HalSensors::sdlAudioCaptureCallback(void* userdata, uint8_t* stream, int len) {
     if (userdata == nullptr || stream == nullptr || len <= 0) {
         return;
     }
     HalSensors* self = static_cast<HalSensors*>(userdata);
+    if (self->test_wav_injecting) {
+        return; // Durante a injeção de WAV de teste o microfone real é ignorado (não mistura os dois sinais)
+    }
     const int16_t* pcm_samples = reinterpret_cast<const int16_t*>(stream);
     size_t sample_count = static_cast<size_t>(len) / sizeof(int16_t);
     self->processCapturedAudioSamples(pcm_samples, sample_count);
@@ -1842,11 +1968,11 @@ void HalSensors::processCapturedAudioSamples(const int16_t* samples, size_t samp
         if (computed_db > MAX_SPL_DB)     computed_db = MAX_SPL_DB;
     }
 
-    // 2. Grava amostras no buffer circular de 4 segundos (16kHz Mono) e executa o DSP do Ouvido 2.0
-    // quando o bicho não está falando no speaker e fora da janela de guarda contra eco acústico (2.5s pós-TTS)
+    // 2. Grava amostras no buffer circular sempre que estiver em modo microfone (inclusive na guarda anti-eco,
+    // para o pre-roll da frase) e executa o DSP do Ouvido 2.0 só fora da guarda
     uint32_t now_ms = M5.millis();
     std::lock_guard<std::mutex> lock(mic_buffer_mutex);
-    if (current_audio_mode == AUDIO_MODE_MIC && now_ms >= mic_echo_guard_until_ms) {
+    if (current_audio_mode == AUDIO_MODE_MIC) {
         for (size_t i = 0; i < sample_count; ++i) {
             mic_ring_buffer[mic_ring_write_pos] = samples[i];
             ++mic_ring_write_pos;
@@ -1855,6 +1981,8 @@ void HalSensors::processCapturedAudioSamples(const int16_t* samples, size_t samp
                 mic_ring_filled = true;
             }
         }
+    }
+    if (current_audio_mode == AUDIO_MODE_MIC && now_ms >= mic_echo_guard_until_ms) {
         analyzeSharedPcmBlockDsp(samples, sample_count, computed_db, rms_raw, now_ms);
         // Suavização exponencial rápida para animar os VU meters laterais com responsividade
         realtime_mic_db = (realtime_mic_db * 0.45f) + (computed_db * 0.55f);
@@ -1980,6 +2108,7 @@ void HalSensors::updateWebcamPipBuffer(uint32_t now_ms) {
             pip_hd_frame_rgb565[i] = static_cast<uint16_t>(((lum >> 3) << 11) | ((lum >> 2) << 5) | (lum >> 3));
         }
     }
+    ++pip_generation;
 }
 
 bool HalSensors::readWebcamTrackerFile(int32_t& out_face_x, int32_t& out_face_y, bool& out_face_detected) {
@@ -2336,9 +2465,7 @@ void HalSensors::readPcSimulatedAudio() {
 
     if (local_double_clap) {
         audio_data.double_clap_detected = true;
-        vad_active_speech_frames = 0;
-        vad_trailing_silence_frames = 0;
-        audio_data.vad_speech_active = false;
+        resetVadPhrase();
     }
     if (local_whistle) {
         audio_data.whistle_detected = true;
@@ -2431,9 +2558,7 @@ void HalSensors::readPcSimulatedAudio() {
                 audio_data.vad_keyword_mode = true;
                 M5_LOGI("[HAL-PC] Escuta Hands-Free (VAD): MODO PALAVRA-CHAVE ('Bicho' / 'Ei Bicho' / 'Oraculo').");
             }
-            vad_active_speech_frames = 0;
-            vad_trailing_silence_frames = 0;
-            audio_data.vad_speech_active = false;
+            resetVadPhrase();
         }
 
         // [G]: Dispara Galeria Timelapse de Snapshots do Cartão SD no Visor PIP
@@ -2538,6 +2663,8 @@ void HalSensors::readPcSimulatedAudio() {
     }
 #endif
 
+    feedTestWavInjection(current_ms);
+
     // 2. Processa sinais acústicos reais do microfone quando ativo, em modo escuta (AUDIO_MODE_MIC) e fora da guarda anti-eco
     if (mic_capture_active && current_audio_mode == AUDIO_MODE_MIC && current_ms >= mic_echo_guard_until_ms) {
         // Detecta pico repentino de barulho alto real (> 85 dB, exceto se for Duas Palmas) -> EMOTION_STARTLED
@@ -2549,70 +2676,20 @@ void HalSensors::readPcSimulatedAudio() {
             M5_LOGI("[HAL-PC] Pico de barulho alto REAL detectado no microfone: %.1f dB!", current_mic_db);
         }
 
-        // Máquina de Estados VAD Hands-Free 2.0 (Limiar Adaptativo + Rejeição de Teclado + Palavra-Chave "Bicho"):
-        const float vad_speech_thresh_db = fmaxf(45.5f, local_noise_floor + 10.5f);
+        if (vad_debug_log && current_ms - last_vad_debug_ms >= 100U) {
+            last_vad_debug_ms = current_ms;
+            M5_LOGI("[VAD-DEBUG] db=%.1f piso=%.1f inicio>=%.1f frase=%d voz=%ums kw=%d silabas=%u teclado=%d",
+                    current_mic_db, local_noise_floor, fmaxf(45.5f, local_noise_floor + VAD_START_MARGIN_DB),
+                    static_cast<int>(vad_in_phrase), static_cast<unsigned int>(vad_voiced_ms),
+                    static_cast<int>(local_wake_latched), static_cast<unsigned int>(local_syllables),
+                    static_cast<int>(local_typing));
+        }
+        // Máquina de Estados VAD Hands-Free (por tempo, com histerese) + Palavra-Chave "Bicho"
         if (audio_data.vad_enabled && !manual_meeting_override && !audio_data.is_continuous_speech) {
-            bool is_voice_frame = (current_mic_db >= vad_speech_thresh_db && current_mic_db < 84.0f) &&
-                                  (!local_typing || local_voiced_frames >= 6U);
-            if (is_voice_frame) {
-                vad_active_speech_frames++;
-                vad_trailing_silence_frames = 0;
-                if (vad_active_speech_frames >= 22U && vad_active_speech_frames <= 215U) {
-                    audio_data.vad_speech_active = true;
-                }
-            } else {
-                if (vad_active_speech_frames >= 24U && vad_active_speech_frames <= 210U) {
-                    vad_trailing_silence_frames++;
-                    // ~0.75s (45 frames a 60Hz) de pausa após a frase + cooldown de 12s -> avalia Palavra-Chave!
-                    if (vad_trailing_silence_frames >= 45U && (current_ms - last_vad_trigger_ms > 12000U)) {
-                        bool facing_bicho = gaze_data.face_detected && (std::fabs(gaze_data.head_yaw_deg) <= 24.0f);
-                        bool kw_ok = !audio_data.vad_keyword_mode ||
-                                     local_wake_latched ||
-                                     (facing_bicho && local_voiced_frames >= 8U && local_syllables >= 2U);
-                        audio_data.wake_word_detected = local_wake_latched || (facing_bicho && local_syllables >= 2U);
-
-                        if (kw_ok && local_voiced_frames >= 5U) {
-                            audio_data.vad_phrase_completed = true;
-                            audio_data.vad_speech_active = false;
-                            audio_data.last_event = AUDIO_EVENT_VOICE_COMMAND;
-                            last_vad_trigger_ms = current_ms;
-                            M5_LOGI("[OUVIDO-VAD] Frase de voz detectada (PalavraChave=%s, Formantes=%u, Silabas=%u)! Acionando Oraculo...",
-                                    local_wake_latched ? "FONETICA_BICHO" : (audio_data.vad_keyword_mode ? "ENCARANDO_BICHO" : "LIVRE"),
-                                    static_cast<unsigned int>(local_voiced_frames),
-                                    static_cast<unsigned int>(local_syllables));
-                        } else {
-                            M5_LOGI("[OUVIDO-VAD] Ruido/fala lateral ignorado pelo filtro de Palavra-Chave (Formantes=%u, Silabas=%u, Yaw=%.1f).",
-                                    static_cast<unsigned int>(local_voiced_frames),
-                                    static_cast<unsigned int>(local_syllables),
-                                    gaze_data.head_yaw_deg);
-                        }
-                        vad_active_speech_frames = 0;
-                        vad_trailing_silence_frames = 0;
-                        {
-                            std::lock_guard<std::mutex> lock(mic_buffer_mutex);
-                            dsp_kw_phonetic_stage = 0;
-                            dsp_voiced_formant_frames = 0;
-                            dsp_syllable_peaks = 0;
-                            dsp_wake_word_latched = false;
-                        }
-                    }
-                } else {
-                    if (vad_active_speech_frames > 0U && current_mic_db < local_noise_floor + 6.0f) {
-                        std::lock_guard<std::mutex> lock(mic_buffer_mutex);
-                        dsp_kw_phonetic_stage = 0;
-                        dsp_voiced_formant_frames = 0;
-                        dsp_syllable_peaks = 0;
-                        dsp_wake_word_latched = false;
-                    }
-                    vad_active_speech_frames = 0;
-                    vad_trailing_silence_frames = 0;
-                    audio_data.vad_speech_active = false;
-                }
-            }
+            updateVadPhraseStateMachine(current_ms, current_mic_db, local_noise_floor, 45.5f,
+                                        local_typing, local_voiced_frames, local_syllables, local_wake_latched);
         } else {
-            audio_data.vad_speech_active = false;
-            vad_active_speech_frames = 0;
-            vad_trailing_silence_frames = 0;
+            resetVadPhrase();
         }
 
         // Detecta fala contínua real (reunião) se a voz humana (não teclado!) se mantiver acima do piso + 18 dB por ~5.5s

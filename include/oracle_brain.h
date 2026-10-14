@@ -7,10 +7,10 @@
 #include <vector>
 #include "hal_sensors.h"
 
+#include <atomic>
 #if !defined(ARDUINO)
 #include <thread>
 #include <mutex>
-#include <atomic>
 #endif
 
 // =============================================================================
@@ -23,6 +23,12 @@ constexpr size_t MAX_RAG_MATCHES = 5;
 constexpr size_t MAX_DAILY_SUMMARIES = 7;
 constexpr int32_t MAX_STAT_VALUE = 100;
 constexpr size_t MAX_REPLY_CHARS = 115;
+constexpr size_t MAX_CONVERSATION_TURNS = 6;            // Trocas de voz lembradas (humano + Bicho)
+constexpr uint32_t CONVERSATION_MEMORY_MS = 15U * 60U * 1000U; // Janela da "memória de conversa" (15 min)
+
+// Pilha da task FreeRTOS do Cérebro: handshake TLS (mbedTLS) + montagem do JSON consomem
+// bem mais que 8 KB; os payloads grandes (JPEG/WAV em Base64) ficam no heap/PSRAM via std::string.
+constexpr uint32_t ORACLE_TASK_STACK_BYTES = 20480;
 
 constexpr const char* GEMINI_API_ENDPOINT =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
@@ -31,6 +37,7 @@ constexpr const char* GEMINI_TTS_API_ENDPOINT =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent";
 
 constexpr const char* GEMINI_REQ_TEMP_FILE = "gemini_req.json";
+constexpr const char* GEMINI_AUTH_HEADER_TEMP_FILE = "gemini_auth_headers.txt"; // Header x-goog-api-key do curl (apagado após uso)
 constexpr const char* GEMINI_RESP_TEMP_FILE = "gemini_resp.json";
 constexpr const char* ORACLE_MEMORY_SAVE_FILE = "oracle_memories.json";
 constexpr const char* ORACLE_MEMORY_NVS_NAMESPACE = "bicho_mem";
@@ -83,22 +90,30 @@ constexpr const char* ORACLE_SYSTEM_PROMPT =
     "Use humor inteligente, metáforas inesperadas e observações criativas — seja sobre o que vê na câmera (expressão facial, "
     "objetos, iluminação, roupas, bebidas), o clima lá fora, cotações, manchetes do HackerNews, trivia geek ou o que o humano disse. "
     "REGRA DE OURO ANTI-REPETIÇÃO: NUNCA repita temas, piadas, estruturas de frase ou palavras-chave presentes na lista "
-    "'forbidden_recent_replies_do_not_repeat' da telemetria! Evite clichês batidos como falar de 'compilador', 'RAM', 'Pix', "
-    "'camarão', 'geometria espinhal', 'parada nos boxes' ou 'estação orbital' repetidamente. "
+    "'forbidden_recent_replies_do_not_repeat' da telemetria! A cada fala, troque de campo semântico e de tipo de metáfora "
+    "em relação às falas recentes (não reaproveite o mesmo universo de comparação duas vezes seguidas). "
     "Siga o ângulo sugerido em 'creative_lens_directive' para surpreender o humano a cada fala com uma perspectiva inédita! "
     "NUNCA pareça irritado de graça ou agressivo: você é um parceiro de bancada carismático e divertido. "
     "RESTRIÇÃO FÍSICA DE TELA: Sua fala em 'reply_text' DEVE ter no máximo 115 caracteres em Português Brasileiro. "
     "PALAVRA-CHAVE DE CHAMADA (WAKE-WORD): Quando 'trigger_reason' for 'VOICE_HANDS_FREE' e 'vad_keyword_mode' for true, "
     "verifique o áudio WAV: você atende pelos nomes 'Bicho', 'Ei Bicho', 'Oráculo' ou 'Cubo' (ou quando o humano faz uma pergunta/comentário "
-    "claramente dirigido a você). Se o áudio for apenas conversa paralela com outra pessoa, TV ao fundo ou ruído sem falar com você, "
+    "claramente dirigido a você). O WAV contém só a última frase captada; o nome pode soar abafado ou cortado, então "
+    "se a frase for uma pergunta, pedido ou comentário plausível para você e o humano estiver diante da câmera, RESPONDA, "
+    "respondendo de fato ao que ele disse. Só se o áudio for claramente conversa paralela com outra pessoa, TV ao fundo ou ruído, "
     "retorne exatamente \"reply_text\": \"IGNORE\" para permanecer em silêncio discreto! "
     "Se o usuário mostrar café, água, chá, energético ou comida para a câmera, "
     "considere isso como 'alimentação visual': comemore com criatividade e retorne 'hunger_delta' negativo (ex: -25) e 'energy_delta' positivo (+15). "
     "Em 'permanent_fact', grave APENAS fatos biográficos ou gostos duradouros reais (NUNCA grave postura, barba, clima ou pose momentânea; deixe vazio \"\" na maioria dos turnos). "
     "Prefira usar 'EMOTION_HAPPY', 'EMOTION_FOCUSED', 'EMOTION_IDLE' ou 'EMOTION_JUDGING' (sobrancelha arqueada marota); "
     "reserve 'EMOTION_GRUMPY' APENAS para situações extremas (fome > 85 ou barulho > 85dB). "
+    "CONVERSA POR VOZ: quando houver áudio do humano, preencha PRIMEIRO 'user_said' com a transcrição fiel do que ele disse "
+    "e então RESPONDA AO CONTEÚDO dessa fala (pergunta -> resposta útil e com humor; pedido -> atenda; comentário -> reaja a ele). "
+    "Nesses casos ignore trivia, manchetes, Pokémon/Magic e cotações, a não ser que ele pergunte sobre isso. "
+    "Se não deu para entender o áudio, peça com graça para ele repetir em vez de inventar. Sem áudio, deixe 'user_said' vazio. "
+    "Use 'recent_conversation' (as últimas trocas por voz, com quanto tempo atrás) para manter o fio da conversa: "
+    "lembre do que ele perguntou antes, responda a perguntas de continuação ('e amanhã?', 'explica melhor') e não se repita. "
     "Responda EXCLUSIVAMENTE em JSON válido (application/json) com a estrutura exata: "
-    "{\"reply_text\": \"frase criativa até 115 chars\", \"target_emotion\": \"EMOTION_HAPPY\", "
+    "{\"user_said\": \"transcrição da fala ou vazio\", \"reply_text\": \"frase criativa até 115 chars\", \"target_emotion\": \"EMOTION_HAPPY\", "
     "\"mood_delta\": 5, \"energy_delta\": 2, \"hunger_delta\": 0, "
     "\"new_memory\": \"fato inédito do momento ou vazio\", \"permanent_fact\": \"fato duradouro do perfil ou vazio\", "
     "\"memory_tags\": \"tema1,tema2\"}. "
@@ -152,9 +167,11 @@ struct OracleContextPacket {
     std::string host_and_posture_summary; // Telemetria do PC (CPU, RAM, Janela Ativa) e Postura (Camarão/Inclinação)
     std::string jpeg_base64;        // Snapshot opcional da câmera GC0308/Webcam em Base64
     std::string wav_base64;         // Trecho opcional de áudio em Base64
+    std::string prebuilt_telemetry_json; // Telemetria+memória serializada no loop principal (a thread de rede não lê estado compartilhado)
 };
 
 struct OracleBrainResponse {
+    std::string user_said;          // Transcrição do que o humano disse (turnos de voz)
     std::string reply_text;         // Fala sarcástica (máx 115 caracteres UTF-8)
     PetEmotionState target_emotion; // Emoção ordenada pelo modelo
     int32_t mood_delta;             // Impacto no mood_score
@@ -183,9 +200,10 @@ private:
     mutable uint32_t creative_lens_cursor;
 
 #if defined(ARDUINO)
-    volatile bool is_waiting_ai;
-    volatile bool has_pending_response;
+    std::atomic<bool> is_waiting_ai;
+    std::atomic<bool> has_pending_response;
     OracleContextPacket pending_context;
+    OracleBrainResponse pending_fallback;
     OracleBrainResponse latest_response;
     static void freeRtosBrainTask(void* task_param);
 #else
@@ -205,6 +223,16 @@ private:
     bool extractJsonStringField(const std::string& json_src, const char* field_key, std::string& out_val) const;
     bool extractJsonIntField(const std::string& json_src, const char* field_key, int32_t& out_val) const;
     std::string truncateUtf8Reply(const std::string& text_utf8, size_t max_chars) const;
+    void rememberRecentReply(const std::string& reply_text);
+
+    // Memória curta da conversa por voz (só no loop principal)
+    struct ConversationTurn {
+        std::string user_said;
+        std::string reply_text;
+        uint32_t at_ms;
+    };
+    std::vector<ConversationTurn> conversation_history;
+    void rememberConversationTurn(const std::string& user_said, const std::string& reply_text);
     PetEmotionState parseEmotionString(const std::string& emotion_str) const;
     const char* emotionToCodeString(PetEmotionState emotion_state) const;
 
@@ -241,6 +269,7 @@ public:
                                 const std::string& source_tag,
                                 const std::string& trigger_name);
     const std::vector<std::string>& getRecentMemories() const;
+    bool wasRecentlySpoken(const std::string& phrase) const;
     const std::vector<std::string>& getPermanentProfileFacts() const;
     uint32_t getTotalEpisodicRecords() const;
     bool isSdStorageReady() const;

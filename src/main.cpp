@@ -7,6 +7,7 @@
 // Constantes Visuais e de Animação (Padrão UPPER_CASE)
 // =============================================================================
 constexpr uint32_t SLEEP_MODE_FRAME_DELAY_MS = 50; // Reduz ritmo de atualização quando dormindo (~20 FPS)
+constexpr uint32_t PERCEPTION_TASK_STACK_BYTES = 8192; // DSP de áudio + câmera + I2C (4 KB era insuficiente)
 
 // =============================================================================
 // Variáveis de Estado Global (Padrão snake_case)
@@ -71,7 +72,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         perceptionBackgroundTask,
         "PerceptionTask",
-        4096,
+        PERCEPTION_TASK_STACK_BYTES,
         nullptr,
         1,
         nullptr,
@@ -79,11 +80,8 @@ void setup() {
     );
 #endif
 
-    // Saudação inicial bem-humorada e irônica ao ligar na mesa de trabalho
-    pet_controller.speakWithLipSync(
-        hal_sensors,
-        "Sistemas ópticos online, parceiro. Se a reunião ficar chata, pisca duas vezes que eu invento um alerta crítico."
-    );
+    // Saudação inicial sorteada (evita repetir as falas recentes do histórico)
+    pet_controller.speakStartupGreeting(hal_sensors);
 }
 
 void loop() {
@@ -96,6 +94,8 @@ void loop() {
     // 1. No modo PC (native_pc), atualiza a percepção de forma cooperativa no loop principal
     hal_sensors.updateSensors();
 #endif
+    // Publica um snapshot consistente dos sensores para todo o frame (evita corrida entre Core 0 e Core 1)
+    hal_sensors.latchFrameSnapshot();
 
     // 2. Atualiza Máquina de Estados Híbrida (Camada 1 + Camada 2 + Lip-Sync)
     pet_controller.updateController(hal_sensors, frame_start_ms);

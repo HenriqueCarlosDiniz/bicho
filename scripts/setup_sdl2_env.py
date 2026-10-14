@@ -9,8 +9,18 @@ import shutil
 
 pio_packages_dir = os.path.expanduser("~/.platformio/packages/toolchain-gccmingw32")
 mingw_bin_dir = os.path.join(pio_packages_dir, "bin")
-sdl2_base_dir = "C:/tools/SDL2-mingw/SDL2-2.30.10/i686-w64-mingw32"
+# Diretório do SDL2 (MinGW i686): defina SDL2_DIR para usar outra instalação
+DEFAULT_SDL2_DIR = "C:/tools/SDL2-mingw/SDL2-2.30.10/i686-w64-mingw32"
+sdl2_base_dir = os.environ.get("SDL2_DIR", DEFAULT_SDL2_DIR)
 sdl2_bin_dir = os.path.join(sdl2_base_dir, "bin")
+
+if not os.path.isdir(sdl2_base_dir):
+    print("[BICHO] AVISO: SDL2 nao encontrado em '%s'. Defina a variavel SDL2_DIR." % sdl2_base_dir)
+
+env.Append(
+    CPPPATH=[os.path.join(sdl2_base_dir, "include"), os.path.join(sdl2_base_dir, "include", "SDL2")],
+    LIBPATH=[os.path.join(sdl2_base_dir, "lib")],
+)
 
 # Adiciona o compilador MinGW e o diretório bin do SDL2 ao PATH da sessão de build/exec
 path_additions = []

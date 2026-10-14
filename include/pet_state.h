@@ -7,6 +7,7 @@
 #include "hal_sensors.h"
 #include "oracle_brain.h"
 #include "world_context.h"
+#include "voice_synth_worker.h"
 
 // =============================================================================
 // Constantes de Tempo e Limiares da Máquina de Estados (Padrão UPPER_CASE)
@@ -17,6 +18,7 @@ constexpr uint32_t ABSENCE_SLEEP_MINUTES = 3;           // Minutos sem rosto par
 constexpr uint32_t MEETING_FATIGUE_MINUTES = 4;         // Minutos de fala contínua para cansaço de reunião
 constexpr uint32_t STARTLE_DURATION_MS = 1800;          // Duração do tremor e susto após barulho alto
 constexpr uint32_t ORACLE_COOLDOWN_MS = 3500;           // Tempo mínimo entre consultas ao Oráculo
+constexpr uint32_t VOICE_PENDING_MAX_WAIT_MS = 9000;    // Quanto uma frase de voz espera o Oráculo ficar livre
 
 // Constantes do Motor de Voz WAV PCM 24kHz HD e Lip-Sync Procedural (UPPER_CASE)
 constexpr uint32_t VOICE_WAV_SAMPLE_RATE_HZ = 24000;    // Taxa de amostragem 24kHz HD Mono PCM 16-bit
@@ -278,6 +280,17 @@ private:
     bool shift_debrief_done_today;
     uint32_t debrief_overlay_until_ms;
 
+    // 6. Frase de voz aguardando o Oráculo ficar livre (áudio capturado no fim da frase, não depois)
+    uint32_t pending_voice_until_ms;
+    uint32_t sfx_playback_until_ms;     // Fim do efeito sonoro atual: depois dele o barramento volta ao microfone
+    std::string pending_voice_wav_b64;
+
+    // 7. Síntese de voz assíncrona (fora do loop de 60 FPS). Declarado após oracle_brain para ser destruído antes dele.
+    VoiceSynthWorker voice_worker;
+    uint32_t voice_job_id;
+    bool awaiting_voice;
+    uint32_t voice_wait_deadline_ms;
+
     // Métodos internos de percepção, interpolação, DSP de voz, gráficos SD e regras de negócio (camelCase)
     void updatePresenceAndFocus(const GazeTargetData& gaze_data, const AudioSensorData& audio_data, uint32_t now_ms);
     void updateAcousticReactions(const AudioSensorData& audio_data, const EnvironmentSensorData& env_data, uint32_t now_ms);
@@ -285,8 +298,9 @@ private:
     void interpolateFacePose();
     void updateLipSyncStep(HalSensors& hal_sensors, uint32_t now_ms);
     void playProceduralCharTone(char current_char);
-    bool generateAndLoadVoiceWav(const char* reply_text);
-    void applyEmotionalSciFiDspToWav(std::vector<uint8_t>& target_wav, PetEmotionState emotion_state);
+    bool loadVoiceWavForPlayback(std::vector<uint8_t>& synthesized_wav);
+    void beginLipSyncPlayback(uint32_t now_ms);
+    static void applyEmotionalSciFiDspToWav(std::vector<uint8_t>& target_wav, PetEmotionState emotion_state);
     void initOrGenerateSdAudioAssets();
     void initOrGenerateSdGraphicsAssets();
     bool loadSdThemeToBuffer(uint8_t theme_index);
@@ -343,6 +357,9 @@ public:
 
     // Inicia a fala procedural letra por letra com Lip-Sync e legenda gradual
     void speakWithLipSync(HalSensors& hal_sensors, const char* reply_text);
+
+    // Sorteia e fala uma apresentação ao ligar, evitando as frases ditas recentemente
+    void speakStartupGreeting(HalSensors& hal_sensors);
 
     // Corta imediatamente qualquer áudio/fala em andamento (ex.: gesto Shhh ou Palma de Stop)
     void stopSpeakingImmediately(HalSensors& hal_sensors, const char* silent_banner_text = nullptr);

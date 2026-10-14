@@ -5,14 +5,13 @@
 #include <cstring>
 #include <ctime>
 
-#if __has_include(<ArduinoJson.h>)
-#include <ArduinoJson.h>
-#endif
+#include "json_utils.h"
 
 #if defined(ARDUINO)
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include "ca_roots.h"
 #else
 #include <fstream>
 #include <sstream>
@@ -40,6 +39,8 @@ WorldContextService::WorldContextService()
       last_dollar_alert_ms(0),
       last_github_alert_ms(0),
       pending_sync_mask(0),
+      location_latitude(DEFAULT_LOCATION_LATITUDE),
+      location_longitude(DEFAULT_LOCATION_LONGITUDE),
       is_sync_running(false),
       has_completed_sync(false)
 {
@@ -84,6 +85,16 @@ void WorldContextService::initWorldContext() {
     staged_context = world_context;
 }
 
+void WorldContextService::setLocation(float latitude, float longitude) {
+    bool valid = latitude >= -90.0f && latitude <= 90.0f && longitude >= -180.0f && longitude <= 180.0f &&
+                 !(latitude == 0.0f && longitude == 0.0f);
+    if (!valid || isSyncRunning()) {
+        return;
+    }
+    location_latitude = latitude;
+    location_longitude = longitude;
+}
+
 bool WorldContextService::executeHttpGet(const std::string& url, std::string& out_body) const {
     out_body.clear();
 
@@ -93,7 +104,7 @@ bool WorldContextService::executeHttpGet(const std::string& url, std::string& ou
     }
 
     WiFiClientSecure secure_client;
-    secure_client.setInsecure();
+    secure_client.setCACert(TRUSTED_ROOT_CA_BUNDLE);
     HTTPClient http_client;
 
     if (!http_client.begin(secure_client, url.c_str())) {
@@ -138,136 +149,27 @@ bool WorldContextService::executeHttpGet(const std::string& url, std::string& ou
 #endif
 }
 
-bool WorldContextService::parseJsonFloatAfterKey(const std::string& json_str, const char* key_str, float& out_val, size_t start_offset) const {
-    std::string pattern = std::string("\"") + key_str + "\"";
-    size_t key_pos = json_str.find(pattern, start_offset);
-    if (key_pos == std::string::npos) {
-        return false;
-    }
-    size_t colon_pos = json_str.find(':', key_pos + pattern.size());
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-    size_t pos = colon_pos + 1;
-    while (pos < json_str.size() &&
-           (json_str[pos] == ' ' || json_str[pos] == '\t' ||
-            json_str[pos] == '\n' || json_str[pos] == '\r' || json_str[pos] == '\"')) {
-        ++pos;
-    }
-    if (pos >= json_str.size()) {
-        return false;
-    }
-    char* end_ptr = nullptr;
-    float val = std::strtof(json_str.c_str() + pos, &end_ptr);
-    if (end_ptr == json_str.c_str() + pos) {
-        return false;
-    }
-    out_val = val;
-    return true;
-}
-
-bool WorldContextService::parseJsonIntAfterKey(const std::string& json_str, const char* key_str, int32_t& out_val, size_t start_offset) const {
-    std::string pattern = std::string("\"") + key_str + "\"";
-    size_t key_pos = json_str.find(pattern, start_offset);
-    if (key_pos == std::string::npos) {
-        return false;
-    }
-    size_t colon_pos = json_str.find(':', key_pos + pattern.size());
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-    size_t pos = colon_pos + 1;
-    while (pos < json_str.size() &&
-           (json_str[pos] == ' ' || json_str[pos] == '\t' ||
-            json_str[pos] == '\n' || json_str[pos] == '\r' || json_str[pos] == '\"')) {
-        ++pos;
-    }
-    if (pos >= json_str.size()) {
-        return false;
-    }
-    char* end_ptr = nullptr;
-    long val = std::strtol(json_str.c_str() + pos, &end_ptr, 10);
-    if (end_ptr == json_str.c_str() + pos) {
-        return false;
-    }
-    out_val = static_cast<int32_t>(val);
-    return true;
-}
-
-bool WorldContextService::parseJsonStringAfterKey(const std::string& json_str, const char* key_str, std::string& out_val, size_t start_offset) const {
-    std::string pattern = std::string("\"") + key_str + "\"";
-    size_t key_pos = json_str.find(pattern, start_offset);
-    if (key_pos == std::string::npos) {
-        return false;
-    }
-    size_t colon_pos = json_str.find(':', key_pos + pattern.size());
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-    size_t quote_start = json_str.find('\"', colon_pos + 1);
-    if (quote_start == std::string::npos) {
-        return false;
-    }
-
-    std::string extracted;
-    size_t i = quote_start + 1;
-    while (i < json_str.size()) {
-        char c = json_str[i];
-        if (c == '\\' && (i + 1) < json_str.size()) {
-            char next_c = json_str[i + 1];
-            if (next_c == '\"' || next_c == '\\' || next_c == '/') {
-                extracted += next_c;
-                i += 2;
-                continue;
-            } else if (next_c == 'n' || next_c == 'r' || next_c == 't') {
-                extracted += ' ';
-                i += 2;
-                continue;
-            }
-        }
-        if (c == '\"') {
-            out_val = extracted;
-            return true;
-        }
-        extracted += c;
-        ++i;
-    }
-    return false;
-}
-
 bool WorldContextService::fetchWeatherInfo(ExternalWorldContext& target_ctx) const {
     std::string body;
-    if (!executeHttpGet(OPEN_METEO_API_URL, body)) {
+    char weather_url[256];
+    std::snprintf(weather_url, sizeof(weather_url), OPEN_METEO_API_URL_FMT,
+                  static_cast<double>(location_latitude), static_cast<double>(location_longitude));
+    if (!executeHttpGet(weather_url, body)) {
         return false;
     }
 
-    // Procura o bloco "current":{...} da resposta do Open-Meteo (evita pegar "current_units")
-    size_t current_block_pos = body.find("\"current\":{");
-    if (current_block_pos == std::string::npos) {
-        current_block_pos = body.find("\"current\": {");
-    }
-    if (current_block_pos == std::string::npos) {
+    WeatherReading reading;
+    reading.temperature_c = target_ctx.outdoor_temp_celsius;
+    reading.humidity_percent = target_ctx.humidity_percent;
+    reading.is_day = target_ctx.is_day_time;
+    if (!parseOpenMeteoCurrent(body, reading)) {
         return false;
     }
 
-    float temp_c = target_ctx.outdoor_temp_celsius;
-    int32_t humidity = target_ctx.humidity_percent;
-    int32_t is_day_val = target_ctx.is_day_time ? 1 : 0;
-    float precip_mm = 0.0f;
-    int32_t weather_code = 0;
-
-    if (!parseJsonFloatAfterKey(body, "temperature_2m", temp_c, current_block_pos)) {
-        return false;
-    }
-    parseJsonIntAfterKey(body, "relative_humidity_2m", humidity, current_block_pos);
-    parseJsonIntAfterKey(body, "is_day", is_day_val, current_block_pos);
-    parseJsonFloatAfterKey(body, "precipitation", precip_mm, current_block_pos);
-    parseJsonIntAfterKey(body, "weather_code", weather_code, current_block_pos);
-
-    target_ctx.outdoor_temp_celsius = temp_c;
-    target_ctx.humidity_percent = humidity;
-    target_ctx.is_day_time = (is_day_val != 0);
-    target_ctx.is_raining = (precip_mm > 0.0f) || (weather_code >= 51);
+    target_ctx.outdoor_temp_celsius = reading.temperature_c;
+    target_ctx.humidity_percent = reading.humidity_percent;
+    target_ctx.is_day_time = reading.is_day;
+    target_ctx.is_raining = (reading.precipitation_mm > 0.0f) || (reading.weather_code >= 51);
     target_ctx.has_valid_sync = true;
     return true;
 }
@@ -278,34 +180,19 @@ bool WorldContextService::fetchFinanceInfo(ExternalWorldContext& target_ctx) con
         return false;
     }
 
-    size_t usd_pos = body.find("\"USDBRL\"");
-    size_t btc_pos = body.find("\"BTCBRL\"");
-
-    bool updated = false;
-    if (usd_pos != std::string::npos) {
-        float bid_rate = target_ctx.usd_brl_rate;
-        float var_pct = target_ctx.usd_variation_pct;
-        if (parseJsonFloatAfterKey(body, "bid", bid_rate, usd_pos)) {
-            target_ctx.usd_brl_rate = bid_rate;
-            updated = true;
-        }
-        if (parseJsonFloatAfterKey(body, "pctChange", var_pct, usd_pos)) {
-            target_ctx.usd_variation_pct = var_pct;
-        }
+    FinanceReading reading;
+    if (!parseAwesomeFinance(body, reading)) {
+        return false;
     }
-
-    if (btc_pos != std::string::npos) {
-        float btc_var = target_ctx.btc_variation_pct;
-        if (parseJsonFloatAfterKey(body, "pctChange", btc_var, btc_pos)) {
-            target_ctx.btc_variation_pct = btc_var;
-            updated = true;
-        }
+    if (reading.has_usd) {
+        target_ctx.usd_brl_rate = reading.usd_brl_bid;
+        target_ctx.usd_variation_pct = reading.usd_pct_change;
     }
-
-    if (updated) {
-        target_ctx.has_valid_sync = true;
+    if (reading.has_btc) {
+        target_ctx.btc_variation_pct = reading.btc_pct_change;
     }
-    return updated;
+    target_ctx.has_valid_sync = true;
+    return true;
 }
 
 bool WorldContextService::fetchGithubStatusInfo(ExternalWorldContext& target_ctx) const {
@@ -314,17 +201,11 @@ bool WorldContextService::fetchGithubStatusInfo(ExternalWorldContext& target_ctx
         return false;
     }
 
-    size_t status_pos = body.find("\"status\"");
-    if (status_pos == std::string::npos) {
-        return false;
-    }
-
     std::string indicator;
     std::string description;
-    if (!parseJsonStringAfterKey(body, "indicator", indicator, status_pos)) {
+    if (!parseGithubStatus(body, indicator, description)) {
         return false;
     }
-    parseJsonStringAfterKey(body, "description", description, status_pos);
 
     target_ctx.is_github_down = (indicator != "none" && !indicator.empty());
     if (!description.empty()) {
@@ -344,10 +225,13 @@ bool WorldContextService::fetchNationalHolidaysInfo(ExternalWorldContext& target
     localtime_r(&now_time, &local_tm);
 #endif
 
+    // Sem relógio sincronizado (NTP) o ano seria 1970: melhor não consultar do que mostrar feriado errado
+    if (local_tm.tm_year + 1900 < 2024) {
+        return false;
+    }
+
     char holiday_url[96] = {0};
-    std::snprintf(holiday_url, sizeof(holiday_url),
-                  "https://brasilapi.com.br/api/feriados/v1/%04d",
-                  local_tm.tm_year + 1900);
+    std::snprintf(holiday_url, sizeof(holiday_url), BRASIL_HOLIDAYS_API_URL_FMT, local_tm.tm_year + 1900);
 
     std::string body;
     if (!executeHttpGet(holiday_url, body)) {
@@ -370,47 +254,11 @@ bool WorldContextService::fetchNationalHolidaysInfo(ExternalWorldContext& target
     std::snprintf(tomorrow_str, sizeof(tomorrow_str), "%04d-%02d-%02d",
                   tomorrow_tm.tm_year + 1900, tomorrow_tm.tm_mon + 1, tomorrow_tm.tm_mday);
 
-    // Verifica se hoje é feriado nacional
-    size_t today_pos = body.find(today_str);
-    if (today_pos != std::string::npos) {
-        std::string holiday_name;
-        if (parseJsonStringAfterKey(body, "name", holiday_name, today_pos)) {
-            target_ctx.upcoming_holiday_name = "HOJE: " + holiday_name;
-            return true;
-        }
+    std::string holiday_label;
+    if (!parseBrasilHolidays(body, today_str, tomorrow_str, holiday_label)) {
+        return false;
     }
-
-    // Verifica se amanhã é feriado nacional
-    size_t tomorrow_pos = body.find(tomorrow_str);
-    if (tomorrow_pos != std::string::npos) {
-        std::string holiday_name;
-        if (parseJsonStringAfterKey(body, "name", holiday_name, tomorrow_pos)) {
-            target_ctx.upcoming_holiday_name = "AMANHÃ: " + holiday_name;
-            return true;
-        }
-    }
-
-    // Caso nem hoje nem amanhã sejam feriados, localiza o próximo feriado do ano no calendário
-    size_t search_pos = 0;
-    while (true) {
-        std::string h_date;
-        size_t date_key = body.find("\"date\"", search_pos);
-        if (date_key == std::string::npos) {
-            break;
-        }
-        if (parseJsonStringAfterKey(body, "date", h_date, date_key)) {
-            if (h_date >= std::string(today_str)) {
-                std::string h_name;
-                if (parseJsonStringAfterKey(body, "name", h_name, date_key)) {
-                    target_ctx.upcoming_holiday_name = h_name + " (" + h_date + ")";
-                    return true;
-                }
-            }
-        }
-        search_pos = date_key + 6;
-    }
-
-    target_ctx.upcoming_holiday_name = "Sem feriado próximo";
+    target_ctx.upcoming_holiday_name = holiday_label;
     return true;
 }
 
@@ -420,22 +268,19 @@ bool WorldContextService::fetchTechAndGeekTrivia(ExternalWorldContext& target_ct
     // 1. Hacker News Top Story: pega o primeiro ID de topstories.json e consulta item/{id}.json
     std::string hn_list;
     if (executeHttpGet(HACKER_NEWS_TOP_URL, hn_list)) {
-        size_t bracket_pos = hn_list.find('[');
-        if (bracket_pos != std::string::npos) {
-            long top_id = std::strtol(hn_list.c_str() + bracket_pos + 1, nullptr, 10);
-            if (top_id > 0) {
-                char item_url[128];
-                std::snprintf(item_url, sizeof(item_url), "%s%ld.json", HACKER_NEWS_ITEM_PREFIX, top_id);
-                std::string item_body;
-                if (executeHttpGet(item_url, item_body)) {
-                    std::string hn_title;
-                    if (parseJsonStringAfterKey(item_body, "title", hn_title) && !hn_title.empty()) {
-                        if (hn_title.size() > 90) {
-                            hn_title = hn_title.substr(0, 87) + "...";
-                        }
-                        target_ctx.top_tech_headline = hn_title;
-                        any_ok = true;
+        long top_id = 0;
+        if (parseHackerNewsTopId(hn_list, top_id)) {
+            char item_url[128];
+            std::snprintf(item_url, sizeof(item_url), "%s%ld.json", HACKER_NEWS_ITEM_PREFIX, top_id);
+            std::string item_body;
+            if (executeHttpGet(item_url, item_body)) {
+                std::string hn_title;
+                if (parseHackerNewsTitle(item_body, hn_title)) {
+                    if (hn_title.size() > 90) {
+                        hn_title = hn_title.substr(0, 87) + "...";
                     }
+                    target_ctx.top_tech_headline = hn_title;
+                    any_ok = true;
                 }
             }
         }
@@ -450,8 +295,7 @@ bool WorldContextService::fetchTechAndGeekTrivia(ExternalWorldContext& target_ct
         if (executeHttpGet(SCRYFALL_RANDOM_CARD_URL, card_body)) {
             std::string card_name;
             std::string type_line;
-            if (parseJsonStringAfterKey(card_body, "name", card_name) && !card_name.empty()) {
-                parseJsonStringAfterKey(card_body, "type_line", type_line);
+            if (parseScryfallCard(card_body, card_name, type_line)) {
                 target_ctx.random_geek_trivia = "Card MTG: " + card_name +
                     (type_line.empty() ? "" : (" (" + type_line + ")"));
                 geek_loaded = true;
@@ -467,27 +311,7 @@ bool WorldContextService::fetchTechAndGeekTrivia(ExternalWorldContext& target_ct
         std::string poke_body;
         if (executeHttpGet(poke_url, poke_body)) {
             std::string poke_name;
-#if __has_include(<ArduinoJson.h>)
-            JsonDocument filter_doc;
-            filter_doc["name"] = true;
-            JsonDocument poke_doc;
-            if (deserializeJson(poke_doc, poke_body, DeserializationOption::Filter(filter_doc)) == DeserializationError::Ok &&
-                poke_doc["name"].is<const char*>()) {
-                poke_name = poke_doc["name"].as<const char*>();
-            }
-#endif
-            if (poke_name.empty()) {
-                // Em pokemon-species/{id}, a chave raiz "name" fica logo após "is_mythical"
-                size_t root_name_anchor = poke_body.find("\"is_mythical\"");
-                if (root_name_anchor == std::string::npos) {
-                    root_name_anchor = poke_body.find("\"species\"");
-                }
-                if (root_name_anchor != std::string::npos) {
-                    parseJsonStringAfterKey(poke_body, "name", poke_name, root_name_anchor);
-                } else {
-                    parseJsonStringAfterKey(poke_body, "name", poke_name);
-                }
-            }
+            parsePokemonSpeciesName(poke_body, poke_name);
             if (!poke_name.empty()) {
                 char trivia_buf[128];
                 std::snprintf(trivia_buf, sizeof(trivia_buf), "Pokémon #%u sorteado: %s",
@@ -613,7 +437,7 @@ void WorldContextService::syncExternalWorldData(uint32_t now_ms) {
     BaseType_t created = xTaskCreatePinnedToCore(
         WorldContextService::freeRtosWorldSyncTask,
         "WorldSyncTask",
-        8192,
+        WORLD_SYNC_TASK_STACK_BYTES,
         this,
         1,
         nullptr,

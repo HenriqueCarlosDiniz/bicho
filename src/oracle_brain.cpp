@@ -1,4 +1,5 @@
 #include "oracle_brain.h"
+#include "json_utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,7 +17,11 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include "ca_roots.h"
 #include <ctime>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
 #else
 #include <fstream>
 #include <sstream>
@@ -96,6 +101,7 @@ OracleBrain::OracleBrain()
     habit_matrix.cyber_level = 1;
     latest_response = {
         "",
+        "",
         EMOTION_JUDGING,
         0,
         0,
@@ -150,6 +156,38 @@ void OracleBrain::initBrain() {
         consolidatePreviousDaysLogs();
     }
 }
+
+#if !defined(ARDUINO)
+// Grava os headers de autenticação num arquivo temporário lido pelo curl via "-H @arquivo",
+// para que a chave da API não apareça na linha de comando (lista de processos) nem na URL.
+static bool writeCurlAuthHeaderFile(const std::string& api_key) {
+    std::ofstream header_file(GEMINI_AUTH_HEADER_TEMP_FILE, std::ios::binary | std::ios::trunc);
+    if (!header_file.is_open()) {
+        return false;
+    }
+    header_file << "x-goog-api-key: " << api_key << "\n";
+    header_file << "Content-Type: application/json\n";
+    return header_file.good();
+}
+
+static int runCurlPostWithAuth(const std::string& api_key,
+                               const char* endpoint_url,
+                               const char* request_file,
+                               const char* response_file,
+                               int timeout_sec) {
+    if (!writeCurlAuthHeaderFile(api_key)) {
+        return -1;
+    }
+    std::string curl_cmd =
+        "curl -s -m " + std::to_string(timeout_sec) +
+        " -X POST -H @" + std::string(GEMINI_AUTH_HEADER_TEMP_FILE) +
+        " --data-binary @" + std::string(request_file) +
+        " \"" + std::string(endpoint_url) + "\" -o " + std::string(response_file) + " >nul 2>&1";
+    int exit_code = std::system(curl_cmd.c_str());
+    std::remove(GEMINI_AUTH_HEADER_TEMP_FILE);
+    return exit_code;
+}
+#endif
 
 std::string OracleBrain::resolveApiKey() const {
     if (AI_API_KEY != nullptr && std::strlen(AI_API_KEY) > 10 &&
@@ -323,6 +361,30 @@ std::string OracleBrain::buildTelemetryJsonString(const OracleContextPacket& con
         telemetry_json += "]";
     }
 
+    // Memória curta da conversa por voz: o que o humano disse e o que o Bicho respondeu (últimos minutos)
+    {
+        const uint32_t now_ms = M5.millis();
+        std::string convo_json;
+        for (const ConversationTurn& turn : conversation_history) {
+            const uint32_t age_ms = now_ms - turn.at_ms;
+            if (age_ms > CONVERSATION_MEMORY_MS) {
+                continue;
+            }
+            char age_buf[32];
+            if (age_ms < 60000U) {
+                std::snprintf(age_buf, sizeof(age_buf), "há %us", static_cast<unsigned int>(age_ms / 1000U));
+            } else {
+                std::snprintf(age_buf, sizeof(age_buf), "há %u min", static_cast<unsigned int>(age_ms / 60000U));
+            }
+            if (!convo_json.empty()) convo_json += ",";
+            convo_json += "\"" + escapeJsonString(std::string("[") + age_buf + "] Humano: " + turn.user_said +
+                                                   " | Bicho: " + turn.reply_text) + "\"";
+        }
+        if (!convo_json.empty()) {
+            telemetry_json += ",\"recent_conversation\":[" + convo_json + "]";
+        }
+    }
+
     telemetry_json += ",\"recent_memories\":[";
     for (size_t i = 0; i < recent_memories.size(); ++i) {
         if (i > 0) {
@@ -364,9 +426,9 @@ std::string OracleBrain::buildTelemetryJsonString(const OracleContextPacket& con
         trigger_focus = "CUTUCÃO NA TELA: O humano clicou em você! Observe a expressão dele na câmera, o ambiente ao fundo ou faça uma piada sobre o toque físico.";
     } else if (context_packet.trigger_reason == "VOICE_HANDS_FREE" || context_packet.trigger_reason == "VOICE_COMMAND") {
         if (context_packet.vad_keyword_mode && context_packet.trigger_reason == "VOICE_HANDS_FREE") {
-            trigger_focus = "VOZ HANDS-FREE (MODO PALAVRA-CHAVE 'BICHO'): Se o humano chamou por 'Bicho', 'Ei Bicho', 'Oráculo', 'Cubo' ou falou claramente com você, responda diretamente ao que ele disse com sagacidade! Se for conversa paralela com outra pessoa ou ruído sem falar com você, retorne reply_text='IGNORE'.";
+            trigger_focus = "VOZ HANDS-FREE (MODO PALAVRA-CHAVE 'BICHO'): Transcreva a fala em 'user_said'. Se o humano chamou por 'Bicho', 'Ei Bicho', 'Oráculo', 'Cubo' ou falou claramente com você, responda AO CONTEÚDO do que ele disse (não comente telemetria aleatória). Se for conversa paralela com outra pessoa ou ruído, retorne reply_text='IGNORE'.";
         } else {
-            trigger_focus = "VOZ DO HUMANO: Responda diretamente ao que o humano acabou de dizer no áudio (ou à expressão dele na câmera) com sagacidade inédita!";
+            trigger_focus = "VOZ DO HUMANO: Transcreva a fala em 'user_said' e responda diretamente ao conteúdo do que ele acabou de dizer, com sagacidade.";
         }
     } else if (context_packet.trigger_reason == "OVERWORK") {
         trigger_focus = "EXCESSO DE FOCO: Convide o humano para esticar as pernas ou beber água usando uma metáfora totalmente nova.";
@@ -388,13 +450,20 @@ std::string OracleBrain::buildTelemetryJsonString(const OracleContextPacket& con
         trigger_focus = "ENCERRAMENTO DE EXPEDIENTE (DEBRIEFING DIÁRIO): Fim de tarde na bancada! Faça um balanço carismático e bem-humorado da missão diária do humano (minutos de foco, nível RPG, posturas e cafés) encerrando o turno.";
     }
 
+    // Em conversa por voz a lente criativa aleatória atrapalha (o modelo comentava a trivia em vez de responder)
+    const bool is_voice_turn = !context_packet.wav_base64.empty();
+    const std::string lens_text = is_voice_turn
+        ? std::string("CONVERSA: responda ao que o humano disse no áudio, com o seu humor de sempre")
+        : std::string(chosen_lens);
     telemetry_json += ",\"creative_lens_directive\":\"" +
-                      escapeJsonString(std::string(chosen_lens) + " | FOCO DO GATILHO: " + trigger_focus) + "\"}";
+                      escapeJsonString(lens_text + " | FOCO DO GATILHO: " + trigger_focus) + "\"}";
     return telemetry_json;
 }
 
 std::string OracleBrain::buildGeminiRequestPayload(const OracleContextPacket& context_packet) const {
-    std::string telemetry_context = buildTelemetryJsonString(context_packet);
+    std::string telemetry_context = context_packet.prebuilt_telemetry_json.empty()
+                                        ? buildTelemetryJsonString(context_packet)
+                                        : context_packet.prebuilt_telemetry_json;
     std::string escaped_system = escapeJsonString(ORACLE_SYSTEM_PROMPT);
     std::string escaped_telemetry = escapeJsonString(telemetry_context);
 
@@ -414,197 +483,46 @@ std::string OracleBrain::buildGeminiRequestPayload(const OracleContextPacket& co
     }
 
     payload += "]}],";
-    payload += "\"generationConfig\":{\"response_mime_type\":\"application/json\",\"temperature\":1.0,\"maxOutputTokens\":220}";
+    payload += "\"generationConfig\":{\"response_mime_type\":\"application/json\",\"temperature\":1.0,\"maxOutputTokens\":360}";
     payload += "}";
     return payload;
 }
 
-static void appendUnicodeCodepointUtf8(uint32_t cp, std::string& out) {
-    if (cp <= 0x7FU) {
-        out += static_cast<char>(cp);
-    } else if (cp <= 0x7FFU) {
-        out += static_cast<char>(0xC0U | ((cp >> 6) & 0x1FU));
-        out += static_cast<char>(0x80U | (cp & 0x3FU));
-    } else if (cp <= 0xFFFFU) {
-        out += static_cast<char>(0xE0U | ((cp >> 12) & 0x0FU));
-        out += static_cast<char>(0x80U | ((cp >> 6) & 0x3FU));
-        out += static_cast<char>(0x80U | (cp & 0x3FU));
-    } else if (cp <= 0x10FFFFU) {
-        out += static_cast<char>(0xF0U | ((cp >> 18) & 0x07U));
-        out += static_cast<char>(0x80U | ((cp >> 12) & 0x3FU));
-        out += static_cast<char>(0x80U | ((cp >> 6) & 0x3FU));
-        out += static_cast<char>(0x80U | (cp & 0x3FU));
-    }
-}
-
-static bool parseHex4Digits(const std::string& s, size_t pos, uint32_t& out_val) {
-    if (pos + 4 > s.size()) return false;
-    uint32_t val = 0;
-    for (size_t k = 0; k < 4; ++k) {
-        char ch = s[pos + k];
-        val <<= 4;
-        if (ch >= '0' && ch <= '9') val |= static_cast<uint32_t>(ch - '0');
-        else if (ch >= 'a' && ch <= 'f') val |= static_cast<uint32_t>(10 + (ch - 'a'));
-        else if (ch >= 'A' && ch <= 'F') val |= static_cast<uint32_t>(10 + (ch - 'A'));
-        else return false;
-    }
-    out_val = val;
-    return true;
-}
-
+// Leitura de campos de nível superior (respostas, config.json e linhas JSONL do SD) via ArduinoJson
 bool OracleBrain::extractJsonStringField(const std::string& json_src, const char* field_key, std::string& out_val) const {
-    std::string pattern = std::string("\"") + field_key + "\"";
-    size_t key_pos = json_src.find(pattern);
-    if (key_pos == std::string::npos) {
-        return false;
-    }
-    size_t colon_pos = json_src.find(':', key_pos + pattern.size());
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-    size_t quote_start = json_src.find('\"', colon_pos + 1);
-    if (quote_start == std::string::npos) {
-        return false;
-    }
-
-    std::string result;
-    size_t i = quote_start + 1;
-    while (i < json_src.size()) {
-        char c = json_src[i];
-        if (c == '\\' && (i + 1) < json_src.size()) {
-            char next_c = json_src[i + 1];
-            // Trata \\uXXXX (duplo escape vindo de JSON aninhado) ou \uXXXX direto
-            if (next_c == 'u' && (i + 6) <= json_src.size()) {
-                uint32_t cp = 0;
-                if (parseHex4Digits(json_src, i + 2, cp)) {
-                    appendUnicodeCodepointUtf8(cp, result);
-                    i += 6;
-                    continue;
-                }
-            } else if (next_c == '\\' && (i + 7) <= json_src.size() && json_src[i + 2] == 'u') {
-                uint32_t cp = 0;
-                if (parseHex4Digits(json_src, i + 3, cp)) {
-                    appendUnicodeCodepointUtf8(cp, result);
-                    i += 7;
-                    continue;
-                }
-            }
-
-            if (next_c == '\"' || next_c == '\\' || next_c == '/') {
-                result += next_c;
-                i += 2;
-                continue;
-            } else if (next_c == 'n') {
-                result += ' ';
-                i += 2;
-                continue;
-            } else if (next_c == 'r' || next_c == 't') {
-                i += 2;
-                continue;
-            }
-        }
-        if (c == '\"') {
-            out_val = result;
-            return true;
-        }
-        result += c;
-        ++i;
-    }
-    return false;
+    return jsonGetString(json_src, field_key, out_val);
 }
 
 bool OracleBrain::extractJsonIntField(const std::string& json_src, const char* field_key, int32_t& out_val) const {
-    std::string pattern = std::string("\"") + field_key + "\"";
-    size_t key_pos = json_src.find(pattern);
-    if (key_pos == std::string::npos) {
-        return false;
-    }
-    size_t colon_pos = json_src.find(':', key_pos + pattern.size());
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-    size_t num_pos = colon_pos + 1;
-    while (num_pos < json_src.size() &&
-           (json_src[num_pos] == ' ' || json_src[num_pos] == '\t' ||
-            json_src[num_pos] == '\n' || json_src[num_pos] == '\r' || json_src[num_pos] == '+')) {
-        ++num_pos;
-    }
-    if (num_pos >= json_src.size()) {
-        return false;
-    }
-    char* end_ptr = nullptr;
-    long parsed_v = std::strtol(json_src.c_str() + num_pos, &end_ptr, 10);
-    if (end_ptr == json_src.c_str() + num_pos) {
-        return false;
-    }
-    out_val = static_cast<int32_t>(parsed_v);
-    return true;
+    return jsonGetInt(json_src, field_key, out_val);
 }
 
 bool OracleBrain::parseGeminiStructuredJson(const std::string& raw_api_response, OracleBrainResponse& out_response) const {
-    if (raw_api_response.empty()) {
+    OracleReplyFields fields;
+    std::string api_error;
+    GeminiParseStatus status = parseGeminiReply(raw_api_response, fields, api_error);
+    if (status == GEMINI_PARSE_API_ERROR) {
+        M5_LOGW("[OracleBrain] Erro retornado pela API Gemini: %s", api_error.c_str());
+        return false;
+    }
+    if (status != GEMINI_PARSE_OK) {
         return false;
     }
 
-    if (raw_api_response.find("\"error\"") != std::string::npos) {
-        std::string err_msg;
-        extractJsonStringField(raw_api_response, "message", err_msg);
-        M5_LOGW("[OracleBrain] Erro retornado pela API Gemini: %s", err_msg.c_str());
-        return false;
+    if (!fields.user_said.empty()) {
+        M5_LOGI("[OracleBrain] Gemini entendeu do audio: \"%s\"", fields.user_said.c_str());
     }
-
-    // 1. O Gemini retorna um envelope JSON com candidates[0].content.parts[0].text contendo o JSON estruturado,
-    // ou pode ser um JSON direto caso venha de mock/teste.
-    std::string inner_json = raw_api_response;
-    std::string extracted_part_text;
-    if (extractJsonStringField(raw_api_response, "text", extracted_part_text) &&
-        extracted_part_text.find("reply_text") != std::string::npos) {
-        inner_json = extracted_part_text;
-    }
-
-    std::string parsed_reply;
-    if (!extractJsonStringField(inner_json, "reply_text", parsed_reply) || parsed_reply.empty()) {
-        return false;
-    }
-
-    std::string parsed_emotion_str = "EMOTION_JUDGING";
-    extractJsonStringField(inner_json, "target_emotion", parsed_emotion_str);
-
-    int32_t parsed_mood_delta = 0;
-    int32_t parsed_energy_delta = 0;
-    int32_t parsed_hunger_delta = 0;
-    extractJsonIntField(inner_json, "mood_delta", parsed_mood_delta);
-    extractJsonIntField(inner_json, "energy_delta", parsed_energy_delta);
-    extractJsonIntField(inner_json, "hunger_delta", parsed_hunger_delta);
-
-    std::string parsed_memory;
-    extractJsonStringField(inner_json, "new_memory", parsed_memory);
-
-    std::string parsed_perm_fact;
-    extractJsonStringField(inner_json, "permanent_fact", parsed_perm_fact);
-
-    std::string parsed_tags;
-    extractJsonStringField(inner_json, "memory_tags", parsed_tags);
-
-    out_response.reply_text = truncateUtf8Reply(parsed_reply, MAX_REPLY_CHARS);
+    std::string parsed_emotion_str = fields.target_emotion.empty() ? "EMOTION_JUDGING" : fields.target_emotion;
+    out_response.user_said = truncateUtf8Reply(fields.user_said, 200);
+    out_response.reply_text = truncateUtf8Reply(fields.reply_text, MAX_REPLY_CHARS);
     out_response.target_emotion = parseEmotionString(parsed_emotion_str);
-    out_response.mood_delta = parsed_mood_delta;
-    out_response.energy_delta = parsed_energy_delta;
-    out_response.hunger_delta = parsed_hunger_delta;
-    out_response.new_memory = truncateUtf8Reply(parsed_memory, 80);
-    out_response.permanent_fact = truncateUtf8Reply(parsed_perm_fact, 90);
-    out_response.memory_tags = truncateUtf8Reply(parsed_tags, 60);
+    out_response.mood_delta = fields.mood_delta;
+    out_response.energy_delta = fields.energy_delta;
+    out_response.hunger_delta = fields.hunger_delta;
+    out_response.new_memory = truncateUtf8Reply(fields.new_memory, 80);
+    out_response.permanent_fact = truncateUtf8Reply(fields.permanent_fact, 90);
+    out_response.memory_tags = truncateUtf8Reply(fields.memory_tags, 60);
     out_response.from_cloud_api = true;
-
-    // Registra a fala nas últimas MAX_RECENT_REPLIES (20) respostas para bloquear repetição de piadas/temas nos próximos turnos
-    if (!out_response.reply_text.empty() && out_response.reply_text != "IGNORE" && out_response.reply_text != "[IGNORE]") {
-        if (recent_replies.empty() || recent_replies.back() != out_response.reply_text) {
-            if (recent_replies.size() >= MAX_RECENT_REPLIES) {
-                recent_replies.erase(recent_replies.begin());
-            }
-            recent_replies.push_back(out_response.reply_text);
-        }
-    }
 
     M5_LOGI("[OracleBrain] Resposta Gemini (Flash-Lite) recebida: \"%s\" [%s] | PermFact='%s' | Tags='%s'",
             out_response.reply_text.c_str(),
@@ -625,21 +543,21 @@ bool OracleBrain::executePlatformHttpsPost(const std::string& request_payload_js
                                    : GEMINI_API_ENDPOINT;
 
 #if defined(ARDUINO)
-    // No M5Stack CoreS3 (ESP32-S3): usa WiFiClientSecure (setInsecure) + HTTPClient
+    // No M5Stack CoreS3 (ESP32-S3): WiFiClientSecure validando a cadeia contra as CAs raiz embarcadas
     if (WiFi.status() != WL_CONNECTED) {
         return false;
     }
 
     WiFiClientSecure secure_client;
-    secure_client.setInsecure();
+    secure_client.setCACert(TRUSTED_ROOT_CA_BUNDLE);
     HTTPClient http_client;
 
-    std::string full_url = std::string(endpoint_url) + "?key=" + api_key;
-    if (!http_client.begin(secure_client, full_url.c_str())) {
+    if (!http_client.begin(secure_client, endpoint_url)) {
         return false;
     }
 
     http_client.addHeader("Content-Type", "application/json");
+    http_client.addHeader("x-goog-api-key", api_key.c_str());
     http_client.setTimeout(8500);
     int http_code = http_client.POST(request_payload_json.c_str());
     if (http_code == HTTP_CODE_OK) {
@@ -662,13 +580,7 @@ bool OracleBrain::executePlatformHttpsPost(const std::string& request_payload_js
 
     std::remove(GEMINI_RESP_TEMP_FILE);
 
-    std::string curl_cmd =
-        "curl -s -m 15 -X POST -H \"Content-Type: application/json\" --data-binary @" +
-        std::string(GEMINI_REQ_TEMP_FILE) + " \"" +
-        std::string(endpoint_url) + "?key=" + api_key + "\" -o " +
-        std::string(GEMINI_RESP_TEMP_FILE) + " >nul 2>&1";
-
-    int exit_code = std::system(curl_cmd.c_str());
+    int exit_code = runCurlPostWithAuth(api_key, endpoint_url, GEMINI_REQ_TEMP_FILE, GEMINI_RESP_TEMP_FILE, 15);
     if (exit_code != 0) {
         return false;
     }
@@ -908,7 +820,7 @@ void OracleBrain::freeRtosBrainTask(void* task_param) {
             self->parseGeminiStructuredJson(raw_resp, computed_resp)) {
             self->latest_response = computed_resp;
         } else {
-            self->latest_response = self->getFallbackOfflineResponse(self->pending_context);
+            self->latest_response = self->pending_fallback;
         }
 
         self->has_pending_response = true;
@@ -927,19 +839,26 @@ bool OracleBrain::requestBrainAnalysis(const OracleContextPacket& context_packet
     is_waiting_ai = true;
     has_pending_response = false;
 
+    // Tudo que lê memórias/histórico (estado compartilhado) é resolvido aqui, no loop principal.
+    // A thread/task de rede só recebe cópias prontas: telemetria serializada e resposta offline.
+    OracleContextPacket captured_context = context_packet;
+    captured_context.prebuilt_telemetry_json = buildTelemetryJsonString(context_packet);
+    OracleBrainResponse captured_fallback = getFallbackOfflineResponse(context_packet);
+
 #if defined(ARDUINO)
-    pending_context = context_packet;
+    pending_context = captured_context;
+    pending_fallback = captured_fallback;
     BaseType_t task_created = xTaskCreatePinnedToCore(
         OracleBrain::freeRtosBrainTask,
         "OracleBrainTask",
-        8192,
+        ORACLE_TASK_STACK_BYTES,
         this,
         1,
         nullptr,
         0 // Core 0 dedicado para rede/IA mantendo Core 1 livre para UI a 60 FPS
     );
     if (task_created != pdPASS) {
-        latest_response = getFallbackOfflineResponse(context_packet);
+        latest_response = captured_fallback;
         has_pending_response = true;
         is_waiting_ai = false;
     }
@@ -949,12 +868,10 @@ bool OracleBrain::requestBrainAnalysis(const OracleContextPacket& context_packet
         worker_thread.join();
     }
 
-    OracleContextPacket captured_context = context_packet;
-    worker_thread = std::thread([this, captured_context]() mutable {
+    worker_thread = std::thread([this, captured_context, captured_fallback]() mutable {
         // Se ainda não houver snapshot JPEG no pacote, captura 1 frame 320x240 da webcam em background sem travar os 60 FPS
         if (captured_context.jpeg_base64.empty()) {
-            HalSensors cam_helper;
-            captured_context.jpeg_base64 = cam_helper.captureCameraJpegBase64();
+            captured_context.jpeg_base64 = HalSensors::capturePcWebcamJpegBase64();
         }
 
         std::string req_json = buildGeminiRequestPayload(captured_context);
@@ -967,7 +884,7 @@ bool OracleBrain::requestBrainAnalysis(const OracleContextPacket& context_packet
         }
 
         if (!cloud_ok) {
-            result_resp = getFallbackOfflineResponse(captured_context);
+            result_resp = captured_fallback;
         }
 
         {
@@ -989,13 +906,46 @@ bool OracleBrain::pollCompletedResponse(OracleBrainResponse& out_response) {
 #if defined(ARDUINO)
     out_response = latest_response;
     has_pending_response = false;
-    return true;
 #else
-    std::lock_guard<std::mutex> lock(response_mutex);
-    out_response = latest_response;
-    has_pending_response = false;
-    return true;
+    {
+        std::lock_guard<std::mutex> lock(response_mutex);
+        out_response = latest_response;
+        has_pending_response = false;
+    }
 #endif
+    if (out_response.from_cloud_api) {
+        rememberRecentReply(out_response.reply_text);
+        rememberConversationTurn(out_response.user_said, out_response.reply_text);
+    }
+    return true;
+}
+
+bool OracleBrain::wasRecentlySpoken(const std::string& phrase) const {
+    return std::find(recent_replies.begin(), recent_replies.end(), phrase) != recent_replies.end();
+}
+
+void OracleBrain::rememberConversationTurn(const std::string& user_said, const std::string& reply_text) {
+    if (user_said.empty() || reply_text.empty() || reply_text == "IGNORE" || reply_text == "[IGNORE]") {
+        return;
+    }
+    if (conversation_history.size() >= MAX_CONVERSATION_TURNS) {
+        conversation_history.erase(conversation_history.begin());
+    }
+    conversation_history.push_back({user_said, reply_text, M5.millis()});
+}
+
+// Registra a fala nas últimas MAX_RECENT_REPLIES respostas para bloquear repetição de piadas/temas
+// (chamado só no loop principal, nunca na thread de rede)
+void OracleBrain::rememberRecentReply(const std::string& reply_text) {
+    if (reply_text.empty() || reply_text == "IGNORE" || reply_text == "[IGNORE]") {
+        return;
+    }
+    if (recent_replies.empty() || recent_replies.back() != reply_text) {
+        if (recent_replies.size() >= MAX_RECENT_REPLIES) {
+            recent_replies.erase(recent_replies.begin());
+        }
+        recent_replies.push_back(reply_text);
+    }
 }
 
 bool OracleBrain::isWaitingAi() const {
@@ -1005,6 +955,17 @@ bool OracleBrain::isWaitingAi() const {
 // =============================================================================
 // Sistema Cognitivo em 3 Níveis no Cartão microSD + Micro-RAG + Matriz de Hábitos
 // =============================================================================
+
+// Data de compilação (__DATE__ = "Mmm dd yyyy") usada só quando o relógio ainda não foi sincronizado
+static void getBuildDate(int& out_year, int& out_month, int& out_day) {
+    static const char* const MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char* build_date = __DATE__;
+    char month_str[4] = {build_date[0], build_date[1], build_date[2], '\0'};
+    const char* month_pos = std::strstr(MONTHS, month_str);
+    out_month = (month_pos != nullptr) ? static_cast<int>((month_pos - MONTHS) / 3) + 1 : 1;
+    out_day = std::atoi(build_date + 4);
+    out_year = std::atoi(build_date + 7);
+}
 
 void OracleBrain::getCurrentDateAndHour(std::string& out_date_str, uint8_t& out_hour) const {
     std::time_t now_t = std::time(nullptr);
@@ -1018,7 +979,11 @@ void OracleBrain::getCurrentDateAndHour(std::string& out_date_str, uint8_t& out_
         out_date_str = buf;
         out_hour = static_cast<uint8_t>(local_tm->tm_hour % 24);
     } else {
-        out_date_str = "2026-10-14";
+        int build_year = 0, build_month = 0, build_day = 0;
+        getBuildDate(build_year, build_month, build_day);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", build_year, build_month, build_day);
+        out_date_str = buf;
         out_hour = 12;
     }
 }
@@ -1929,7 +1894,10 @@ bool OracleBrain::saveEventSnapshotToSd(const std::string& event_tag) const {
                       lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
                       lt->tm_hour, lt->tm_min, lt->tm_sec);
     } else {
-        std::snprintf(stamp_buf, sizeof(stamp_buf), "20261014_120000");
+        int build_year = 0, build_month = 0, build_day = 0;
+        getBuildDate(build_year, build_month, build_day);
+        std::snprintf(stamp_buf, sizeof(stamp_buf), "%04d%02d%02d_boot%06u", build_year, build_month, build_day,
+                      static_cast<unsigned int>(M5.millis() / 1000U % 1000000U));
     }
 
     // 1. Arquiva o quadro PIP 64x48 em escala de cinza para a Galeria Timelapse [G]
@@ -2089,13 +2057,13 @@ bool OracleBrain::synthesizeCloudNeuralTtsWav(const std::string& text_utf8, std:
         return false;
     }
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setCACert(TRUSTED_ROOT_CA_BUNDLE);
     HTTPClient http;
-    std::string full_url = std::string(GEMINI_TTS_API_ENDPOINT) + "?key=" + api_key;
-    if (!http.begin(client, full_url.c_str())) {
+    if (!http.begin(client, GEMINI_TTS_API_ENDPOINT)) {
         return false;
     }
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-goog-api-key", api_key.c_str());
     http.setTimeout(9000);
     int code = http.POST(req_payload.c_str());
     if (code >= 200 && code < 300) {
@@ -2114,12 +2082,7 @@ bool OracleBrain::synthesizeCloudNeuralTtsWav(const std::string& text_utf8, std:
         req_out.write(req_payload.data(), static_cast<std::streamsize>(req_payload.size()));
     }
     std::remove(tts_resp_file);
-    std::string cmd =
-        "curl -s -m 8 -X POST -H \"Content-Type: application/json\" --data-binary @" +
-        std::string(tts_req_file) + " \"" +
-        std::string(GEMINI_TTS_API_ENDPOINT) + "?key=" + api_key + "\" -o " +
-        std::string(tts_resp_file) + " >nul 2>&1";
-    if (std::system(cmd.c_str()) == 0) {
+    if (runCurlPostWithAuth(api_key, GEMINI_TTS_API_ENDPOINT, tts_req_file, tts_resp_file, 8) == 0) {
         std::ifstream resp_in(tts_resp_file, std::ios::binary);
         if (resp_in.is_open()) {
             std::ostringstream ss;
@@ -2137,7 +2100,7 @@ bool OracleBrain::synthesizeCloudNeuralTtsWav(const std::string& text_utf8, std:
 
     // Extrai o campo "data" dentro de inlineData (PCM 24000 Hz 16-bit signed little-endian)
     std::string b64_audio;
-    if (!extractJsonStringField(raw_resp, "data", b64_audio) || b64_audio.size() < 128) {
+    if (!parseGeminiTtsAudioBase64(raw_resp, b64_audio) || b64_audio.size() < 128) {
         return false;
     }
 

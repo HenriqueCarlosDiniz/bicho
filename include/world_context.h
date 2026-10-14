@@ -5,10 +5,10 @@
 #include <stdint.h>
 #include <string>
 
+#include <atomic>
 #if !defined(ARDUINO)
 #include <thread>
 #include <mutex>
-#include <atomic>
 #endif
 
 // =============================================================================
@@ -21,11 +21,16 @@ constexpr uint32_t TRIVIA_SYNC_INTERVAL_MS   = 3600000U; // 60 minutos
 constexpr uint32_t HOLIDAY_SYNC_INTERVAL_MS  = 43200000U;// 12 horas
 constexpr uint32_t WORLD_TRIGGER_COOLDOWN_MS = 180000U;  // 3 minutos de cooldown por gatilho autônomo
 
+constexpr uint32_t WORLD_SYNC_TASK_STACK_BYTES = 16384U; // Pilha da task de rede (TLS + parsing)
+
 constexpr float EXTREME_HEAT_THRESHOLD_C     = 30.0f;    // Alerta se temperatura > 30.0 °C
 constexpr float DOLLAR_SPIKE_THRESHOLD_PCT   = 1.5f;     // Alerta se abs(variação USD) >= 1.5%
 
-constexpr const char* OPEN_METEO_API_URL =
-    "https://api.open-meteo.com/v1/forecast?latitude=-23.55&longitude=-46.63&current=temperature_2m,relative_humidity_2m,is_day,precipitation,weather_code";
+constexpr float DEFAULT_LOCATION_LATITUDE  = -23.5505f; // São Paulo (substituído por sd_card/config.json)
+constexpr float DEFAULT_LOCATION_LONGITUDE = -46.6333f;
+
+constexpr const char* OPEN_METEO_API_URL_FMT =
+    "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,is_day,precipitation,weather_code";
 
 constexpr const char* AWESOME_FINANCE_API_URL =
     "https://economia.awesomeapi.com.br/last/USD-BRL,BTC-BRL";
@@ -33,8 +38,8 @@ constexpr const char* AWESOME_FINANCE_API_URL =
 constexpr const char* GITHUB_STATUS_API_URL =
     "https://www.githubstatus.com/api/v2/status.json";
 
-constexpr const char* BRASIL_HOLIDAYS_API_URL =
-    "https://brasilapi.com.br/api/feriados/v1/2026";
+constexpr const char* BRASIL_HOLIDAYS_API_URL_FMT =
+    "https://brasilapi.com.br/api/feriados/v1/%04d";
 
 constexpr const char* HACKER_NEWS_TOP_URL =
     "https://hacker-news.firebaseio.com/v0/topstories.json";
@@ -84,10 +89,12 @@ private:
     uint32_t last_github_alert_ms;
 
     uint32_t pending_sync_mask;
+    float location_latitude;
+    float location_longitude;
 
 #if defined(ARDUINO)
-    volatile bool is_sync_running;
-    volatile bool has_completed_sync;
+    std::atomic<bool> is_sync_running;
+    std::atomic<bool> has_completed_sync;
     ExternalWorldContext staged_context;
     static void freeRtosWorldSyncTask(void* task_param);
 #else
@@ -106,10 +113,6 @@ private:
     bool fetchNationalHolidaysInfo(ExternalWorldContext& target_ctx) const;
     bool fetchTechAndGeekTrivia(ExternalWorldContext& target_ctx, uint32_t seed_val) const;
 
-    // Helpers leves de parsing JSON (camelCase)
-    bool parseJsonFloatAfterKey(const std::string& json_str, const char* key_str, float& out_val, size_t start_offset = 0) const;
-    bool parseJsonIntAfterKey(const std::string& json_str, const char* key_str, int32_t& out_val, size_t start_offset = 0) const;
-    bool parseJsonStringAfterKey(const std::string& json_str, const char* key_str, std::string& out_val, size_t start_offset = 0) const;
     void runPendingSyncTasks(ExternalWorldContext& working_ctx, uint32_t mask, uint32_t seed_ms) const;
 
 public:
@@ -118,6 +121,9 @@ public:
 
     // Inicializa valores padrão e agenda a primeira sincronização em background
     void initWorldContext();
+
+    // Define a localização usada pelo clima (chamar antes da primeira sincronização)
+    void setLocation(float latitude, float longitude);
 
     // Verifica timers no loop principal (sem bloquear os 60 FPS) e dispara sincronização assíncrona
     void syncExternalWorldData(uint32_t now_ms);
