@@ -826,7 +826,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             current_emotion = EMOTION_LISTENING;
             emotion_lock_until_ms = now_ms + 4500U;
             spawnHudPopup("MODO SILENCIO", 120.0f, 44.0f, COLOR_CYBER_ORANGE, 1800U);
-            stopSpeakingImmediately(hal_sensors, "[MODO SILÊNCIO ATIVO — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU 2 PALMAS P/ SOM)]");
+            stopSpeakingImmediately(hal_sensors, "[MODO SILÊNCIO ATIVO — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU JOINHA P/ SOM)]");
             M5_LOGI("[SILENCIO] Modo Silencio Indefinido ATIVADO via tecla [Q]! Interacao por texto mantida.");
         } else {
             current_emotion = EMOTION_HAPPY;
@@ -843,11 +843,10 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         }
     }
 
-    // 2.7. Reação Imediata (< 50ms, 100% local) a Palma Aberta ✋ na câmera e Joinha via tecla [J]!
-    // (1) 👍 Joinha (Tecla [J]): Elogio instantâneo (+8% Humor, +10 XP, EMOTION_HAPPY) e encerra Modo Silêncio Indefinido!
-    if (gaze_data.gesture_thumbs_up && (now_ms - last_hand_gesture_react_ms > 5500U)) {
+    // 2.7. Reação Imediata (< 50ms, 100% local) a Palma Aberta ✋ (entrar em silêncio) e Joinha 👍 (encerrar modo silêncio)!
+    // (1) 👍 Joinha bem definido (Câmera ou Tecla [J]): Atua exclusivamente como encerramento do Modo Silêncio Indefinido!
+    if (gaze_data.gesture_thumbs_up && is_muted_indefinitely && (now_ms - last_hand_gesture_react_ms > 3500U)) {
         last_hand_gesture_react_ms = now_ms;
-        bool was_muted = is_muted_indefinitely;
         is_muted_indefinitely = false; // Joinha encerra o modo silêncio indefinido!
         pip_display_until_ms = now_ms + 5500U;
         current_emotion = EMOTION_HAPPY;
@@ -856,19 +855,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         wink_until_ms = now_ms + 560U;
         internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 8, 0, MAX_STAT_VALUE);
         oracle_brain.addXpPoints(10);
-        spawnHudPopup("JOINHA! +10 XP", 116.0f, 44.0f, COLOR_CYBER_GREEN, 2000U);
+        spawnHudPopup("JOINHA: VOZ ATIVA!", 108.0f, 44.0f, COLOR_CYBER_GREEN, 2000U);
         playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
         if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
-            static const char* const THUMB_PHRASES[] = {
-                "Joinha recebido! Moral da bancada subiu mais 10 pontos de experiência!",
-                "Valeu pelo incentivo, parceiro! Sistemas operando com moral máxima!",
-                "Aprovação registrada! Ganhei 10 XP e motivação extra no cubo!"
-            };
-            speakWithLipSync(hal_sensors, was_muted
-                ? "Joinha recebido! Modo silêncio encerrado e sistemas prontos na bancada!"
-                : THUMB_PHRASES[(local_phrase_cursor++) % 3U]);
+            speakWithLipSync(hal_sensors, "Joinha confirmado! Modo silêncio encerrado e sistemas de voz prontos na bancada!");
         }
-        M5_LOGI("[GESTO] Joinha ([J]) acionado! +8 Humor, +10 XP e voz ativa.");
+        M5_LOGI("[GESTO-OPTICO] Joinha bem definido detectado! Modo Silencio Indefinido encerrado (+8 Humor, +10 XP).");
     }
     // (2) ✋ Palma Aberta ("Stop / Silêncio" ou Debriefing de Fim de Tarde após 17:30):
     else if (gaze_data.gesture_open_palm && !gaze_data.gesture_thumbs_up &&
@@ -887,12 +879,12 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             }
             M5_LOGI("[DEBRIEFING] Ritual manual de encerramento de expediente acionado por Palma Aberta apos 17:30!");
         } else {
-            is_muted_indefinitely = true; // Permanece em silêncio de áudio até tecla [Q], [J] ou 2 Palmas 👏👏!
+            is_muted_indefinitely = true; // Permanece em silêncio de áudio até Joinha 👍 ou tecla [Q]!
             pip_display_until_ms = now_ms + 5000U;
             current_emotion = EMOTION_LISTENING;
             emotion_lock_until_ms = now_ms + 4500U;
             spawnHudPopup("PALMA: SILENCIO", 114.0f, 44.0f, COLOR_CYBER_ORANGE, 1900U);
-            stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU 2 PALMAS P/ SOM)]");
+            stopSpeakingImmediately(hal_sensors, "[GESTO: PALMA ABERTA — VOZ MUDA, INTERAÇÃO POR TEXTO ATIVA ([Q] OU JOINHA P/ SOM)]");
             M5_LOGI("[GESTO-OPTICO] Palma aberta (STOP/SILENCIO) detectada! Modo Silencio Indefinido ativado.");
         }
     }
@@ -921,36 +913,8 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         }
     }
 
-    // 2.8. Ouvido 2.0: Gestos Acústicos em Tempo Real (Duas Palmas 👏👏 e Assobio 🎵) — PC e CoreS3!
-    if (audio_data.double_clap_detected && (now_ms - last_acoustic_gesture_ms > 4500U)) {
-        last_acoustic_gesture_ms = now_ms;
-        blink_bounce_until_ms = now_ms + 260U;
-        if (is_muted_indefinitely) {
-            is_muted_indefinitely = false;
-            current_emotion = EMOTION_HAPPY;
-            emotion_lock_until_ms = now_ms + 4000U;
-            oracle_brain.addXpPoints(5);
-            spawnHudPopup("2 PALMAS! +5 XP", 114.0f, 44.0f, COLOR_CYBER_GREEN, 1900U);
-            playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-            speakWithLipSync(hal_sensors, "Duas palmas detectadas no microfone! Modo silêncio encerrado, estou na escuta!");
-        } else {
-            pip_display_until_ms = (now_ms < pip_display_until_ms) ? 0U : (now_ms + 8000U);
-            current_emotion = EMOTION_HAPPY;
-            emotion_lock_until_ms = now_ms + 3500U;
-            internal_stats.mood_score = clampStatValue(internal_stats.mood_score + 4, 0, MAX_STAT_VALUE);
-            oracle_brain.addXpPoints(5);
-            spawnHudPopup("2 PALMAS! +5 XP", 114.0f, 44.0f, COLOR_CYBER_GREEN, 1900U);
-            playSdSoundEffect(hal_sensors, (std::string(SD_SFX_DIR) + "/sfx_purr_servo.wav").c_str());
-            if (!lip_sync_state.is_speaking && !oracle_brain.isWaitingAi()) {
-                static const char* const CLAP_PHRASES[] = {
-                    "Duas palmas confirmadas no sensor acústico! Visor óptico alternado na tela!",
-                    "Sinal de duas palmas captado! Comutando janela da câmera no HUD!",
-                    "Acústica perfeita! Alternando o monitor óptico com duas palmas!"
-                };
-                speakWithLipSync(hal_sensors, CLAP_PHRASES[(local_phrase_cursor++) % 3U]);
-            }
-        }
-    } else if (audio_data.whistle_detected && (now_ms - last_acoustic_gesture_ms > 8000U)) {
+    // 2.8. Ouvido 2.0: Gesto Acústico em Tempo Real (Assobio 🎵) — PC e CoreS3! (Duas Palmas desativadas)
+    if (audio_data.whistle_detected && (now_ms - last_acoustic_gesture_ms > 8000U)) {
         last_acoustic_gesture_ms = now_ms;
         current_emotion = EMOTION_HAPPY;
         emotion_lock_until_ms = now_ms + 4500U;

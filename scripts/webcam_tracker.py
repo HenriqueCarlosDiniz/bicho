@@ -470,11 +470,10 @@ def get_hand_engine() -> MediaPipeHandEngineONNX:
 
 def detect_hand_and_shhh_gestures(frame_bgr, curr_gray, fx, fy, fw, fh, nose_x, nose_y, rm_x, rm_y, lm_x, lm_y):
     """
-    Detecta na câmera EXCLUSIVAMENTE o gesto manual inequívoco de Palma Aberta (✋ Stop / Silêncio)
+    Detecta na câmera EXCLUSIVAMENTE dois gestos manuais inequívocos para controle de silêncio
     usando o motor neural MediaPipe HandPose 21-Keypoints ONNX (SEM fallback de cor de pele):
-    - gesture_open_palm (✋): Palma aberta vertical com todos os 5 dedos estendidos e separados, fora da área do rosto/barba.
-    (gesture_thumbs_up, gesture_shhh e gesture_victory ficam desativados na câmera para zero falsos positivos
-    ao apoiar a mão no queixo/barba ou segurar caneca; permanecem disponíveis via teclado [J], [Q] e [K]).
+    - gesture_open_palm (✋): Palma aberta vertical com os 5 dedos estendidos e separados (Ativa Modo Silêncio).
+    - gesture_thumbs_up (👍): Punho fechado firme com todos os 4 dedos dobrados e polegar estritamente vertical (Encerra Modo Silêncio).
     """
     gesture_shhh = 0
     gesture_thumbs_up = 0
@@ -487,8 +486,8 @@ def detect_hand_and_shhh_gestures(frame_bgr, curr_gray, fx, fy, fw, fh, nose_x, 
     try:
         engine = get_hand_engine()
         if engine.ready:
-            # Exige alta confiança no detector de palma ONNX (0.75) para ignorar sombras, roupas ou rosto
-            hands_list = engine.detect_hands_21_landmarks(frame_bgr, conf_thresh=0.75)
+            # Exige alta confiança no detector de palma ONNX (0.78) para ignorar sombras, roupas ou rosto
+            hands_list = engine.detect_hands_21_landmarks(frame_bgr, conf_thresh=0.78)
             for pts in hands_list:
                 # Índices MediaPipe:
                 # 0=WRIST | 1..4=THUMB | 5..8=INDEX | 9..12=MIDDLE | 13..16=RING | 17..20=PINKY
@@ -497,9 +496,9 @@ def detect_hand_and_shhh_gestures(frame_bgr, curr_gray, fx, fy, fw, fh, nose_x, 
                 hand_size = float(np.linalg.norm(pts[9, :2] - wrist))
 
                 # Ignora detecções pequenas ou próximas do rosto/queixo/barba
-                if hand_size < 25.0:
+                if hand_size < 28.0:
                     continue
-                if abs(float(palm_center[0]) - face_cx) < (fw * 0.70) and abs(float(palm_center[1]) - face_cy) < (fh * 0.85):
+                if abs(float(palm_center[0]) - face_cx) < (fw * 0.72) and abs(float(palm_center[1]) - face_cy) < (fh * 0.88):
                     continue
 
                 def _finger_strictly_extended_up(mcp_i, pip_i, dip_i, tip_i) -> bool:
@@ -521,8 +520,8 @@ def detect_hand_and_shhh_gestures(frame_bgr, curr_gray, fx, fy, fw, fh, nose_x, 
                     d_tip_p = float(np.linalg.norm(pts[tip_i, :2] - palm_center))
                     d_mcp_p = float(np.linalg.norm(pts[mcp_i, :2] - palm_center))
                     return (
-                        (d_tip_w < d_pip_w * 1.06)
-                        or (d_tip_p < d_mcp_p * 1.22)
+                        (d_tip_w < d_pip_w * 1.04)
+                        and (d_tip_p < d_mcp_p * 1.18)
                     )
 
                 index_up = _finger_strictly_extended_up(5, 6, 7, 8)
@@ -537,13 +536,43 @@ def detect_hand_and_shhh_gestures(frame_bgr, curr_gray, fx, fy, fw, fh, nose_x, 
 
                 curled_count = int(index_curled) + int(middle_curled) + int(ring_curled) + int(pinky_curled)
 
-                # ✋ PALMA ABERTA (Stop / Silêncio): Todos os 4 dedos esticados para cima + polegar aberto + mão vertical
+                # 1. ✋ PALMA ABERTA (Stop / Silêncio): Todos os 4 dedos esticados para cima + polegar aberto + mão vertical
                 if index_up and middle_up and ring_up and pinky_up and curled_count == 0:
                     thumb_open = float(np.linalg.norm(pts[4, :2] - pts[5, :2])) > (hand_size * 0.28)
                     finger_spread = float(np.linalg.norm(pts[8, :2] - pts[20, :2])) > (hand_size * 0.48)
                     palm_vertical = float(wrist[1] - pts[9, 1]) > (hand_size * 0.55)
                     if thumb_open and finger_spread and palm_vertical:
                         gesture_open_palm = 1
+
+                # 2. 👍 JOINHA BEM DEFINIDO (Encerrar Modo Silêncio):
+                # Exige punho fechado (todos os 4 dedos dobrados e nenhum estendido) + polegar estritamente vertical para cima
+                elif (curled_count == 4) and not (index_up or middle_up or ring_up or pinky_up):
+                    # Garante que a ponta do polegar também esteja longe do rosto/queixo
+                    thumb_outside_face = not (
+                        abs(float(pts[4, 0]) - face_cx) < (fw * 0.75)
+                        and abs(float(pts[4, 1]) - face_cy) < (fh * 0.90)
+                    )
+                    # Polegar apontando estritamente para cima: TIP (4) acima de IP (3), IP (3) acima de MCP (2), TIP (4) bem acima de INDEX_MCP (5)
+                    dy_thumb = float(pts[2, 1] - pts[4, 1])
+                    dx_thumb = abs(float(pts[4, 0] - pts[2, 0]))
+                    thumb_vertical_up = (
+                        (pts[4, 1] < pts[3, 1] - hand_size * 0.12)
+                        and (pts[3, 1] < pts[2, 1] - hand_size * 0.08)
+                        and (pts[4, 1] < pts[5, 1] - hand_size * 0.30)
+                        and (dy_thumb > hand_size * 0.38)
+                        and (dx_thumb < dy_thumb * 0.58)
+                    )
+                    # Todas as 4 pontas dos dedos dobrados precisam estar abaixo da articulação IP do polegar
+                    fist_below_thumb = (
+                        (pts[8, 1] > pts[3, 1] + hand_size * 0.06)
+                        and (pts[12, 1] > pts[3, 1] + hand_size * 0.06)
+                        and (pts[16, 1] > pts[3, 1] + hand_size * 0.06)
+                        and (pts[20, 1] > pts[3, 1] + hand_size * 0.06)
+                    )
+                    # Polegar claramente destacado do punho fechado
+                    thumb_clear_of_fist = float(np.linalg.norm(pts[4, :2] - pts[6, :2])) > (hand_size * 0.36)
+                    if thumb_outside_face and thumb_vertical_up and fist_below_thumb and thumb_clear_of_fist:
+                        gesture_thumbs_up = 1
     except Exception:
         pass
 

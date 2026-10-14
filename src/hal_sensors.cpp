@@ -555,43 +555,22 @@ void HalSensors::analyzeSharedPcmBlockDsp(const int16_t* samples,
 
         if (impulse_decayed || imp_dur_ms > 220U) {
             dsp_impulse_active = false;
-            // Transiente curto (< 175 ms): verifica se foi Palma Forte ou Tecla de Teclado Mecânico
-            if (imp_dur_ms <= 175U) {
-                bool is_strong_clap = (dsp_impulse_peak_db >= fmaxf(56.0f, dsp_noise_floor_db + 18.5f)) &&
-                                      (dsp_impulse_max_crest >= 2.45f);
-                if (is_strong_clap) {
-                    uint32_t since_prev_clap = (dsp_impulse_start_ms >= dsp_last_clap_ms)
-                                                   ? (dsp_impulse_start_ms - dsp_last_clap_ms)
-                                                   : 9999U;
-                    if (dsp_clap_stage == 1 && since_prev_clap >= 120U && since_prev_clap <= 750U) {
-                        dsp_double_clap_latched = true;
-                        dsp_clap_stage = 0;
-                        dsp_last_clap_ms = now_ms;
-                        M5_LOGI("[OUVIDO-DSP] Duas Palmas ('Clap-Clap') detectadas! (dt=%u ms, pico=%.1f dB)",
-                                static_cast<unsigned int>(since_prev_clap), dsp_impulse_peak_db);
-                    } else {
-                        dsp_clap_stage = 1;
-                        dsp_last_clap_ms = dsp_impulse_start_ms;
-                    }
-                } else if (imp_dur_ms <= 105U && (dsp_impulse_max_zcr >= 0.19f || dsp_impulse_max_crest >= 2.75f)) {
-                    // Clique curto de alta frequência -> Digitação em Teclado Mecânico!
-                    if (now_ms - dsp_typing_window_start_ms > 2600U) {
-                        dsp_typing_window_start_ms = now_ms;
-                        dsp_typing_click_count = 1;
-                    } else {
-                        if (dsp_typing_click_count < 250) ++dsp_typing_click_count;
-                        if (dsp_typing_click_count >= 3) {
-                            dsp_typing_active_until_ms = now_ms + 2000U;
-                        }
+            dsp_double_clap_latched = false;
+            dsp_clap_stage = 0;
+            // Transiente curto (<= 105 ms): verifica se foi Tecla de Teclado Mecânico (Duas Palmas desativadas)
+            if (imp_dur_ms <= 105U && (dsp_impulse_max_zcr >= 0.19f || dsp_impulse_max_crest >= 2.75f)) {
+                // Clique curto de alta frequência -> Digitação em Teclado Mecânico!
+                if (now_ms - dsp_typing_window_start_ms > 2600U) {
+                    dsp_typing_window_start_ms = now_ms;
+                    dsp_typing_click_count = 1;
+                } else {
+                    if (dsp_typing_click_count < 250) ++dsp_typing_click_count;
+                    if (dsp_typing_click_count >= 3) {
+                        dsp_typing_active_until_ms = now_ms + 2000U;
                     }
                 }
             }
         }
-    }
-
-    // Expira estágio de 1ª palma se a 2ª não vier em 800ms
-    if (dsp_clap_stage == 1 && (now_ms - dsp_last_clap_ms > 800U)) {
-        dsp_clap_stage = 0;
     }
 
     // 4. Detector de Assobio Humano (Senóide estreita 950 Hz a 2800 Hz -> ZCR estável 0.11 a 0.35)
@@ -1815,7 +1794,7 @@ void HalSensors::readCoreS3OnboardSensors() {
                 }
                 if (n >= 22) {
                     (void)shhh_s;
-                    (void)thumb_s;
+                    if (thumb_s != 0) thumb_active_until_ms = now_ms + 950U;
                     (void)vict_s;
                     if (palm_s != 0) palm_active_until_ms = now_ms + 950U;
                 }
@@ -2168,7 +2147,9 @@ bool HalSensors::readWebcamTrackerFile(int32_t& out_face_x, int32_t& out_face_y,
 
     uint32_t now_ms = M5.millis();
     if (parsed >= 26) {
-        (void)thumb_v;
+        if (thumb_v != 0) {
+            thumb_active_until_ms = now_ms + 950U;
+        }
         (void)victory_v;
         (void)shhh_v;
         if (palm_v != 0) {
