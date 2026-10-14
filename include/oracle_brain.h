@@ -7,6 +7,7 @@
 #include <vector>
 #include "hal_sensors.h"
 #include "storage.h"
+#include "retention.h"
 
 #include <atomic>
 #if !defined(ARDUINO)
@@ -136,6 +137,7 @@ struct OracleContextPacket {
     std::string jpeg_base64;        // Snapshot opcional da câmera GC0308/Webcam em Base64
     std::string wav_base64;         // Trecho opcional de áudio em Base64
     std::string prebuilt_telemetry_json; // Telemetria+memória serializada no loop principal (a thread de rede não lê estado compartilhado)
+    bool allow_camera_image = true;      // false no modo privado: nenhuma foto vai para a nuvem
     std::string diary_context_json;      // Objeto JSON do Diário (hoje até agora / ontem / semana), montado pelo DiaryService
 };
 
@@ -205,6 +207,8 @@ private:
         uint32_t at_ms;
     };
     std::vector<ConversationTurn> conversation_history;
+    bool privacy_mode = false;
+    RetentionPolicy retention_policy;
     void rememberConversationTurn(const std::string& user_said, const std::string& reply_text);
     PetEmotionState parseEmotionString(const std::string& emotion_str) const;
     const char* emotionToCodeString(PetEmotionState emotion_state) const;
@@ -243,6 +247,10 @@ public:
                                 const std::string& trigger_name);
     const std::vector<std::string>& getRecentMemories() const;
     bool wasRecentlySpoken(const std::string& phrase) const;
+
+    // Privacidade e retenção: no modo privado não grava álbum, memórias episódicas nem fatos de perfil
+    void setPrivacyMode(bool enabled);
+    void setRetentionPolicy(const RetentionPolicy& policy);
 
     // Chamada de texto puro ao Gemini (resposta JSON), bloqueante: usada pela thread do Diário
     bool requestTextCompletion(const std::string& system_instruction,

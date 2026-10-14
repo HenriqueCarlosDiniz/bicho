@@ -32,7 +32,8 @@ public:
     void start(const OracleBrain* brain, WavDspFn dsp_fn);
 
     // Agenda a síntese da frase; um pedido mais novo substitui o anterior ainda não iniciado
-    uint32_t request(const char* text_utf8, PetEmotionState emotion_state);
+    // store_in_cache=false para falas únicas do Gemini (quase nunca se repetem; só ocupariam o cartão)
+    uint32_t request(const char* text_utf8, PetEmotionState emotion_state, bool store_in_cache = true);
 
     // Invalida o pedido em andamento (o resultado, quando chegar, será descartado)
     void cancel();
@@ -43,6 +44,7 @@ public:
 private:
     void runLoop();
     bool synthesizeWithCache(const std::string& text_utf8,
+                             bool store_in_cache,
                              std::vector<uint8_t>& preloaded_wav,
                              std::vector<uint8_t>& out_wav,
                              std::string& out_cache_path,
@@ -58,6 +60,7 @@ private:
     std::string request_text;
     PetEmotionState request_emotion;
     std::vector<uint8_t> request_cached_wav;
+    bool request_store_cache;
     uint32_t request_id;
     uint32_t next_job_id;
     uint32_t done_id;

@@ -322,7 +322,7 @@ void PetController::stopSpeakingImmediately(HalSensors& hal_sensors, const char*
     }
 }
 
-void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_text) {
+void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_text, bool cache_voice) {
     if (reply_text == nullptr || reply_text[0] == '\0') {
         return;
     }
@@ -350,7 +350,7 @@ void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_
     uint32_t now_ms = M5.millis();
     using_wav_voice = false;
     if (!is_muted_indefinitely) {
-        voice_job_id = voice_worker.request(lip_sync_state.full_text, current_emotion);
+        voice_job_id = voice_worker.request(lip_sync_state.full_text, current_emotion, cache_voice);
         awaiting_voice = true;
         voice_wait_deadline_ms = now_ms + VOICE_SYNTH_MAX_WAIT_MS;
         lip_sync_state.next_char_timestamp_ms = now_ms;

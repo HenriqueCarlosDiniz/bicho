@@ -16,6 +16,7 @@ VoiceSynthWorker::VoiceSynthWorker()
       stop_requested(false),
       has_request(false),
       request_emotion(EMOTION_IDLE),
+      request_store_cache(true),
       request_id(0),
       next_job_id(1),
       done_id(0),
@@ -57,7 +58,7 @@ void VoiceSynthWorker::start(const OracleBrain* brain, WavDspFn dsp) {
 #endif
 }
 
-uint32_t VoiceSynthWorker::request(const char* text_utf8, PetEmotionState emotion_state) {
+uint32_t VoiceSynthWorker::request(const char* text_utf8, PetEmotionState emotion_state, bool store_in_cache) {
     std::string safe_text = (text_utf8 != nullptr) ? text_utf8 : "";
     std::vector<uint8_t> preloaded_wav;
 
@@ -87,6 +88,7 @@ uint32_t VoiceSynthWorker::request(const char* text_utf8, PetEmotionState emotio
         request_text.swap(safe_text);
         request_emotion = emotion_state;
         request_cached_wav.swap(preloaded_wav);
+        request_store_cache = store_in_cache;
         request_id = job_id;
         has_request = true;
     }
@@ -135,6 +137,7 @@ void VoiceSynthWorker::runLoop() {
         std::string text;
         PetEmotionState emotion;
         std::vector<uint8_t> preloaded_wav;
+        bool store_cache = true;
         uint32_t job_id;
         {
             std::unique_lock<std::mutex> lock(job_mutex);
@@ -145,6 +148,7 @@ void VoiceSynthWorker::runLoop() {
             text = request_text;
             emotion = request_emotion;
             preloaded_wav.swap(request_cached_wav);
+            store_cache = request_store_cache;
             job_id = request_id;
             has_request = false;
         }
@@ -153,7 +157,7 @@ void VoiceSynthWorker::runLoop() {
         std::string cache_path_to_save;
         std::vector<uint8_t> raw_wav_to_save;
         uint32_t t0 = M5.millis();
-        bool ok = synthesizeWithCache(text, preloaded_wav, wav, cache_path_to_save, raw_wav_to_save);
+        bool ok = synthesizeWithCache(text, store_cache, preloaded_wav, wav, cache_path_to_save, raw_wav_to_save);
         uint32_t t1 = M5.millis();
         if (ok && dsp_fn != nullptr) {
             dsp_fn(wav, emotion);
@@ -175,6 +179,7 @@ void VoiceSynthWorker::runLoop() {
 }
 
 bool VoiceSynthWorker::synthesizeWithCache(const std::string& text_utf8,
+                                           bool store_in_cache,
                                            std::vector<uint8_t>& preloaded_wav,
                                            std::vector<uint8_t>& out_wav,
                                            std::string& out_cache_path,
@@ -205,8 +210,10 @@ bool VoiceSynthWorker::synthesizeWithCache(const std::string& text_utf8,
     // Passo 2 (Caminho 1): Frase inédita -> Gemini 2.5 Flash TTS via Wi-Fi (a gravação no SD ocorre no poll() na thread principal)
     if (!loaded_raw_wav && oracle_brain->synthesizeCloudNeuralTtsWav(text_utf8, out_wav)) {
         loaded_raw_wav = true;
-        out_cache_path = cache_path;
-        out_raw_wav_for_cache = out_wav;
+        if (store_in_cache) {
+            out_cache_path = cache_path;
+            out_raw_wav_for_cache = out_wav;
+        }
     }
 #else
     (void)preloaded_wav;
@@ -259,7 +266,7 @@ bool VoiceSynthWorker::synthesizeWithCache(const std::string& text_utf8,
             loaded_raw_wav = oracle_brain->synthesizeCloudNeuralTtsWav(text_utf8, out_wav);
         }
 
-        if (loaded_raw_wav && oracle_brain->isSdStorageReady()) {
+        if (loaded_raw_wav && store_in_cache && oracle_brain->isSdStorageReady()) {
             if (storageWriteFile(cache_path, out_wav.data(), out_wav.size())) {
                 M5_LOGI("[SD-TTS] Frase sintetizada em 24kHz HD e salva no cache do Cartao SD: %s", cache_path);
             }

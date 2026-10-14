@@ -171,6 +171,14 @@ void DiaryService::init(const OracleBrain* brain, bool is_enabled, bool keep_tra
             store_transcripts ? "SIM" : "NAO");
 }
 
+void DiaryService::setPrivacyMode(bool enabled) {
+    privacy_mode = enabled;
+}
+
+bool DiaryService::isPrivacyMode() const {
+    return privacy_mode;
+}
+
 bool DiaryService::isEnabled() const {
     return enabled;
 }
@@ -235,6 +243,10 @@ void DiaryService::logEvent(const char* type, const std::string& text) {
 }
 
 void DiaryService::logConversation(const std::string& user_said, const std::string& reply_text, const std::string& tags) {
+    if (privacy_mode) {
+        logEvent("VOICE", "Conversa por voz com o Bicho (modo privado)");
+        return;
+    }
     if (store_transcripts && !user_said.empty()) {
         logEvent("VOICE", "Humano disse: \"" + user_said + "\" | Bicho respondeu: \"" + reply_text + "\"");
     } else {

@@ -108,6 +108,8 @@ PetController::PetController()
       pending_voice_until_ms(0),
       diary_service(),
       sfx_playback_until_ms(0),
+      retention_policy(),
+      privacy_mode(false),
       pending_voice_wav_b64(),
       voice_worker(),
       voice_job_id(0),
@@ -214,6 +216,16 @@ void PetController::initController() {
 void PetController::restorePersistentState(HalSensors& hal_sensors) {
     const SdSystemConfig& sd_cfg = hal_sensors.getSdConfig();
     world_context_service.setLocation(sd_cfg.latitude, sd_cfg.longitude);
+    retention_policy.snapshots_max_files = sd_cfg.snapshots_max_files;
+    retention_policy.tts_cache_max_mb = sd_cfg.tts_cache_max_mb;
+    retention_policy.log_max_lines = sd_cfg.log_max_lines;
+    retention_policy.diary_keep_days = sd_cfg.diary_keep_days;
+    oracle_brain.setRetentionPolicy(retention_policy);
+    runStorageRetention(retention_policy);
+
+    privacy_mode = sd_cfg.privacy_mode;
+    oracle_brain.setPrivacyMode(privacy_mode);
+    diary_service.setPrivacyMode(privacy_mode);
     diary_service.init(&oracle_brain, sd_cfg.diary_enabled, sd_cfg.diary_store_transcripts);
     diary_service.logEvent("SESSION_START", "Bicho ligado na mesa");
     oracle_brain.loadMemoriesFromStorage();
@@ -746,6 +758,19 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
         }
     }
 
+    // 2.64. Tecla [L]: Modo Privado (não grava nada pessoal no cartão e não envia fotos à nuvem)
+    if (audio_data.privacy_toggle_triggered) {
+        privacy_mode = !privacy_mode;
+        hal_sensors.setPrivacyMode(privacy_mode);
+        oracle_brain.setPrivacyMode(privacy_mode);
+        diary_service.setPrivacyMode(privacy_mode);
+        diary_service.logEvent("PRIVACY", privacy_mode ? "Ativou o modo privado" : "Desativou o modo privado");
+        spawnHudPopup(privacy_mode ? "MODO PRIVADO" : "PRIVADO OFF", 118.0f, 44.0f, COLOR_CYBER_ORANGE, 1900U);
+        M5_LOGI("[PRIVACIDADE] Modo privado %s: fotos, notas de voz, transcricoes e memorias %s.",
+                privacy_mode ? "ATIVADO" : "DESATIVADO",
+                privacy_mode ? "NAO sao gravadas; fotos nao vao para a nuvem" : "voltam a ser gravadas");
+    }
+
     // 2.65. Tecla [Q]: Alterna (Toggle) o Modo Silêncio Indefinido manualmente
     if (audio_data.silence_toggle_kbd_triggered) {
         is_muted_indefinitely = !is_muted_indefinitely;
@@ -1048,6 +1073,8 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
             const std::string& reason = oracle_brain.getLastTriggerReason();
             if (reason == "VOICE_HANDS_FREE" || reason == "VOICE_COMMAND") {
                 diary_service.logConversation(brain_result.user_said, payload.reply_text, brain_result.memory_tags);
+            } else if (privacy_mode) {
+                diary_service.logEvent(reason.c_str(), "Interação com o Bicho (modo privado)");
             } else if (!brain_result.new_memory.empty()) {
                 diary_service.logEvent(reason.c_str(), brain_result.new_memory);
             } else {
@@ -1297,10 +1324,13 @@ void PetController::triggerSarcasticOracle(HalSensors& hal_sensors, const char* 
     context_packet.external_world_summary = world_context_service.buildExternalWorldSummary();
     context_packet.host_and_posture_summary = host_posture_buf;
     context_packet.diary_context_json = diary_service.buildContextJson();
+    context_packet.allow_camera_image = !privacy_mode;
 
 #if defined(ARDUINO)
     // No hardware real M5Stack CoreS3, captura o frame JPEG 320x240 diretamente da câmera GC0308 ativa no HalSensors
-    context_packet.jpeg_base64 = hal_sensors.captureCameraJpegBase64();
+    if (!privacy_mode) {
+        context_packet.jpeg_base64 = hal_sensors.captureCameraJpegBase64();
+    }
 #endif
 
     // Captura áudio WAV do microfone APENAS em gatilhos de voz/reunião para evitar que áudio antigo ou ruído sequestre gatilhos visuais
@@ -1369,7 +1399,7 @@ void PetController::applyOracleResponse(HalSensors& hal_sensors, const OracleRes
     syncPersistentState(hal_sensors);
 
     // Mesmo em Modo Silêncio (is_muted_indefinitely), speakWithLipSync anima legenda e boca sem emitir som!
-    speakWithLipSync(hal_sensors, response_payload.reply_text);
+    speakWithLipSync(hal_sensors, response_payload.reply_text, false); // Fala única: não vai para o cache
 }
 
 

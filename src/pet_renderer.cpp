@@ -1480,7 +1480,7 @@ void PetController::renderTacticalDialogueOverlay(M5Canvas& canvas, const char* 
     bool waiting_ai = oracle_brain.isWaitingAi();
     bool is_muted_now = is_muted_indefinitely;
     canvas.fillRect(rtab_x, rtab_y, rtab_w, rtab_h, COLOR_HUD_BADGE_BG);
-    canvas.drawRect(rtab_x, rtab_y, rtab_w, rtab_h, (waiting_ai || is_muted_now) ? COLOR_CYBER_ORANGE : primary_col);
+    canvas.drawRect(rtab_x, rtab_y, rtab_w, rtab_h, (waiting_ai || is_muted_now || privacy_mode) ? COLOR_CYBER_ORANGE : primary_col);
 
     if (sd_gfx_ready) {
         uint8_t icon_idx = lip_sync_state.is_speaking ? 3U : 2U;
@@ -1489,12 +1489,14 @@ void PetController::renderTacticalDialogueOverlay(M5Canvas& canvas, const char* 
 
     canvas.setFont(&fonts::Font0);
     canvas.setTextSize(1);
-    canvas.setTextColor((waiting_ai || is_muted_now) ? COLOR_CYBER_ORANGE : COLOR_CYBER_ICE_LIGHT);
+    canvas.setTextColor((waiting_ai || is_muted_now || privacy_mode) ? COLOR_CYBER_ORANGE : COLOR_CYBER_ICE_LIGHT);
     canvas.setCursor(rtab_x + (sd_gfx_ready ? 15 : 3), rtab_y + 2);
     if (waiting_ai) {
         canvas.print("[IA://GEMINI_2.5]");
     } else if (is_muted_now) {
         canvas.print("[MUDO://SHHH_ON]");
+    } else if (privacy_mode) {
+        canvas.print("[PRIV://LACRADO]");
     } else if (lip_sync_state.is_speaking) {
         canvas.print("[TX://AUDIO_24K]");
     } else if (cached_audio_data.vad_enabled && cached_audio_data.vad_keyword_mode) {

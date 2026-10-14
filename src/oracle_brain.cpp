@@ -877,7 +877,7 @@ bool OracleBrain::requestBrainAnalysis(const OracleContextPacket& context_packet
 
     worker_thread = std::thread([this, captured_context, captured_fallback]() mutable {
         // Se ainda não houver snapshot JPEG no pacote, captura 1 frame 320x240 da webcam em background sem travar os 60 FPS
-        if (captured_context.jpeg_base64.empty()) {
+        if (captured_context.jpeg_base64.empty() && captured_context.allow_camera_image) {
             captured_context.jpeg_base64 = HalSensors::capturePcWebcamJpegBase64();
         }
 
@@ -940,6 +940,14 @@ bool OracleBrain::requestTextCompletion(const std::string& system_instruction,
 
 const std::string& OracleBrain::getLastTriggerReason() const {
     return trigger_reason;
+}
+
+void OracleBrain::setPrivacyMode(bool enabled) {
+    privacy_mode = enabled;
+}
+
+void OracleBrain::setRetentionPolicy(const RetentionPolicy& policy) {
+    retention_policy = policy;
 }
 
 bool OracleBrain::wasRecentlySpoken(const std::string& phrase) const {
@@ -1072,7 +1080,7 @@ bool OracleBrain::savePermanentProfileToSd() const {
 }
 
 void OracleBrain::addPermanentProfileFact(const std::string& permanent_fact) {
-    if (permanent_fact.empty()) {
+    if (permanent_fact.empty() || privacy_mode) {
         return;
     }
     std::string clean_fact = truncateUtf8Reply(permanent_fact, 90);
@@ -1433,6 +1441,9 @@ void OracleBrain::addStructuredMemory(const std::string& memory_fact,
                                       const std::string& memory_tags,
                                       const std::string& trigger_name,
                                       int32_t current_mood) {
+    if (privacy_mode) {
+        return; // Modo privado: nada sobre o humano é gravado na memória do cartão
+    }
     if (!permanent_fact.empty()) {
         addPermanentProfileFact(permanent_fact);
     }
@@ -1662,7 +1673,7 @@ std::string OracleBrain::buildHabitMatrixSummary() const {
 }
 
 bool OracleBrain::saveEventSnapshotToSd(const std::string& event_tag) const {
-    if (!sd_storage_ready) {
+    if (!sd_storage_ready || privacy_mode) {
         return false;
     }
     std::time_t now_t = std::time(nullptr);
@@ -1704,6 +1715,7 @@ bool OracleBrain::saveEventSnapshotToSd(const std::string& event_tag) const {
         return false;
     }
     M5_LOGI("[SD-ALBUM] Snapshot salvo no Cartao SD: %s", fname);
+    pruneSnapshotAlbum(retention_policy);
     return true;
 }
 

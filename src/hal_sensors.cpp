@@ -151,6 +151,7 @@ HalSensors::HalSensors()
       prev_key_k(false),
       prev_key_h(false),
       prev_key_w(false),
+      prev_key_l(false),
       simulated_presence_enabled(true),
       manual_meeting_override(false),
       webcam_ambient_lux(240),
@@ -212,6 +213,11 @@ HalSensors::HalSensors()
     sd_config.morning_briefing_enabled = true;
     sd_config.diary_enabled = true;
     sd_config.diary_store_transcripts = true;
+    sd_config.privacy_mode = false;
+    sd_config.snapshots_max_files = 60;
+    sd_config.tts_cache_max_mb = 15;
+    sd_config.log_max_lines = 1000;
+    sd_config.diary_keep_days = 30;
     std::memset(pip_frame_gray, 0, sizeof(pip_frame_gray));
     std::memset(pip_hd_frame_gray, 0, sizeof(pip_hd_frame_gray));
     std::memset(pip_frame_rgb565, 0, sizeof(pip_frame_rgb565));
@@ -268,6 +274,11 @@ bool HalSensors::loadOrInitSdConfig() {
             cfg_doc["morning_briefing_enabled"] = sd_config.morning_briefing_enabled;
             cfg_doc["diary_enabled"] = sd_config.diary_enabled;
             cfg_doc["diary_store_transcripts"] = sd_config.diary_store_transcripts;
+            cfg_doc["privacy_mode"] = sd_config.privacy_mode;
+            cfg_doc["snapshots_max_files"] = sd_config.snapshots_max_files;
+            cfg_doc["tts_cache_max_mb"] = sd_config.tts_cache_max_mb;
+            cfg_doc["log_max_lines"] = sd_config.log_max_lines;
+            cfg_doc["diary_keep_days"] = sd_config.diary_keep_days;
             std::string default_text;
             serializeJsonPretty(cfg_doc, default_text);
             if (storageWriteText(SD_CONFIG_FILE_PATH, default_text)) {
@@ -304,14 +315,44 @@ bool HalSensors::loadOrInitSdConfig() {
     sd_config.diary_enabled = cfg_doc["diary_enabled"] | sd_config.diary_enabled;
     sd_config.diary_store_transcripts = cfg_doc["diary_store_transcripts"] | sd_config.diary_store_transcripts;
 
-    // Atualiza config.json antigos com as chaves novas (valores padrão), para a opção ficar visível
-    if (cfg_doc["diary_enabled"].isNull() || cfg_doc["diary_store_transcripts"].isNull()) {
-        cfg_doc["diary_enabled"] = sd_config.diary_enabled;
-        cfg_doc["diary_store_transcripts"] = sd_config.diary_store_transcripts;
+    sd_config.privacy_mode = cfg_doc["privacy_mode"] | sd_config.privacy_mode;
+    // Limites com piso para um valor inválido no arquivo não apagar tudo
+    auto readLimit = [&cfg_doc](const char* key, uint32_t current, uint32_t minimum) -> uint32_t {
+        int64_t v = cfg_doc[key] | static_cast<int64_t>(current);
+        return (v < static_cast<int64_t>(minimum)) ? minimum : static_cast<uint32_t>(v);
+    };
+    sd_config.snapshots_max_files = readLimit("snapshots_max_files", sd_config.snapshots_max_files, 5U);
+    sd_config.tts_cache_max_mb = readLimit("tts_cache_max_mb", sd_config.tts_cache_max_mb, 2U);
+    sd_config.log_max_lines = readLimit("log_max_lines", sd_config.log_max_lines, 50U);
+    sd_config.diary_keep_days = readLimit("diary_keep_days", sd_config.diary_keep_days, 2U);
+
+    // Atualiza config.json antigos com as chaves novas (valores atuais/padrão), para as opções ficarem visíveis
+    // (o toolchain do ESP32 compila em C++11: sem lambda genérica)
+    bool added_keys = false;
+    auto ensureBoolKey = [&cfg_doc, &added_keys](const char* key, bool value) {
+        if (cfg_doc[key].isNull()) {
+            cfg_doc[key] = value;
+            added_keys = true;
+        }
+    };
+    auto ensureUintKey = [&cfg_doc, &added_keys](const char* key, uint32_t value) {
+        if (cfg_doc[key].isNull()) {
+            cfg_doc[key] = value;
+            added_keys = true;
+        }
+    };
+    ensureBoolKey("diary_enabled", sd_config.diary_enabled);
+    ensureBoolKey("diary_store_transcripts", sd_config.diary_store_transcripts);
+    ensureBoolKey("privacy_mode", sd_config.privacy_mode);
+    ensureUintKey("snapshots_max_files", sd_config.snapshots_max_files);
+    ensureUintKey("tts_cache_max_mb", sd_config.tts_cache_max_mb);
+    ensureUintKey("log_max_lines", sd_config.log_max_lines);
+    ensureUintKey("diary_keep_days", sd_config.diary_keep_days);
+    if (added_keys) {
         std::string upgraded;
         serializeJsonPretty(cfg_doc, upgraded);
         if (storageWriteText(SD_CONFIG_FILE_PATH, upgraded)) {
-            M5_LOGI("[SD-CFG] '%s' atualizado com as opcoes do Diario (diary_enabled, diary_store_transcripts).", SD_CONFIG_FILE_PATH);
+            M5_LOGI("[SD-CFG] '%s' atualizado com as novas opcoes (diario, privacidade e retencao).", SD_CONFIG_FILE_PATH);
         }
     }
 
@@ -328,6 +369,15 @@ const SdSystemConfig& HalSensors::getSdConfig() const {
     return sd_config;
 }
 
+void HalSensors::setPrivacyMode(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(sensor_mutex);
+    sd_config.privacy_mode = enabled;
+}
+
+bool HalSensors::isPrivacyMode() const {
+    return sd_config.privacy_mode;
+}
+
 bool HalSensors::initHardware() {
     loadOrInitSdConfig();
 #if defined(ARDUINO)
@@ -337,7 +387,7 @@ bool HalSensors::initHardware() {
     const char* vad_debug_env = std::getenv("BICHO_VAD_DEBUG");
     vad_debug_log = (vad_debug_env != nullptr && vad_debug_env[0] == '1');
     loadTestWavInjection();
-    M5_LOGI("[HAL-PC] Controles: RPG [TAB] | Chuva [W] | Gestos: Shhh [Q] Joinha [J] Selfie [K] Palma [H] | Postura [C] | Óptica PIP [X] | Objeto [S] | Tema [T] | Zoom [Z] | Voz [V] | Pomodoro [F] | Timelapse [G] | Som [B] | Nota [N] | Debug [D]");
+    M5_LOGI("[HAL-PC] Controles: RPG [TAB] | Chuva [W] | Gestos: Shhh [Q] Joinha [J] Selfie [K] Palma [H] | Postura [C] | Privado [L] | Óptica PIP [X] | Objeto [S] | Tema [T] | Zoom [Z] | Voz [V] | Pomodoro [F] | Timelapse [G] | Som [B] | Nota [N] | Debug [D]");
 
     // Se o script de rastreamento facial da webcam não estiver rodando ainda, inicia automaticamente em background
     struct stat track_stat;
@@ -801,6 +851,7 @@ void HalSensors::accumulateOneShotEvents() {
     pend.pip_color_mode_triggered |= cur.pip_color_mode_triggered;
     pend.object_scan_triggered |= cur.object_scan_triggered;
     pend.rain_preview_toggle_triggered |= cur.rain_preview_toggle_triggered;
+    pend.privacy_toggle_triggered |= cur.privacy_toggle_triggered;
     pending_hand_wave |= gaze_data.hand_wave_detected;
 }
 
@@ -829,6 +880,7 @@ void HalSensors::latchFrameSnapshot() {
     out.pip_color_mode_triggered |= pend.pip_color_mode_triggered;
     out.object_scan_triggered |= pend.object_scan_triggered;
     out.rain_preview_toggle_triggered |= pend.rain_preview_toggle_triggered;
+    out.privacy_toggle_triggered |= pend.privacy_toggle_triggered;
     front_gaze_data.hand_wave_detected |= pending_hand_wave;
     std::memset(&pending_audio_events, 0, sizeof(pending_audio_events));
     pending_hand_wave = false;
@@ -1012,8 +1064,11 @@ std::string HalSensors::recordUserAudioWav() const {
 
     std::memcpy(&wav_bytes[44], pcm_samples.data(), data_chunk_bytes);
 
-    // 3. Arquiva na "Caixa Preta" de Notas de Voz do Cartão SD (voice_notes/)
+    // 3. Arquiva na "Caixa Preta" de Notas de Voz do Cartão SD (voice_notes/) — nunca no modo privado
     const std::string notes_dir = SD_VOICE_NOTES_DIR;
+    if (sd_config.privacy_mode) {
+        return encodeBase64(wav_bytes.data(), wav_bytes.size());
+    }
     storageWriteFile(notes_dir + "/voice_last.wav", wav_bytes.data(), wav_bytes.size());
 
     std::time_t now_t = std::time(nullptr);
@@ -1655,6 +1710,7 @@ void HalSensors::readCoreS3Microphone() {
     audio_data.pip_color_mode_triggered = false;
     audio_data.object_scan_triggered = false;
     audio_data.rain_preview_toggle_triggered = false;
+    audio_data.privacy_toggle_triggered = false;
 
     if (current_audio_mode != AUDIO_MODE_MIC) {
         return;
@@ -2376,6 +2432,7 @@ void HalSensors::readPcSimulatedAudio() {
     audio_data.pip_color_mode_triggered = false;
     audio_data.object_scan_triggered = false;
     audio_data.rain_preview_toggle_triggered = false;
+    audio_data.privacy_toggle_triggered = false;
 
     // 1. Lê o nível de ruído real e estados do Ouvido 2.0 medidos no callback do SDL_OpenAudioDevice
     float current_mic_db = NOISE_FLOOR_DB;
@@ -2471,6 +2528,7 @@ void HalSensors::readPcSimulatedAudio() {
         bool key_k     = key_state[SDL_SCANCODE_K] != 0;
         bool key_h     = key_state[SDL_SCANCODE_H] != 0;
         bool key_w     = key_state[SDL_SCANCODE_W] != 0;
+        bool key_l     = key_state[SDL_SCANCODE_L] != 0;
 
         // [ESPAÇO]: Dispara pico de ruído alto manual (susto) na borda de subida
         if (key_space && !prev_key_space) {
@@ -2611,6 +2669,11 @@ void HalSensors::readPcSimulatedAudio() {
             audio_data.rain_preview_toggle_triggered = true;
         }
 
+        // [L]: Liga/desliga o Modo Privado (não grava fotos, áudio, transcrições nem envia fotos à nuvem)
+        if (key_l && !prev_key_l) {
+            audio_data.privacy_toggle_triggered = true;
+        }
+
         prev_key_space = key_space;
         prev_key_m     = key_m;
         prev_key_i     = key_i;
@@ -2634,6 +2697,7 @@ void HalSensors::readPcSimulatedAudio() {
         prev_key_k     = key_k;
         prev_key_h     = key_h;
         prev_key_w     = key_w;
+        prev_key_l     = key_l;
     }
 #endif
 

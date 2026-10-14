@@ -166,6 +166,7 @@ struct AudioSensorData {
     bool pip_color_mode_triggered;       // Gatilho para ciclar modo óptico do PIP: Ciano / RGB565 / Térmico (Tecla [X])
     bool object_scan_triggered;          // Gatilho manual para inspecionar objeto na câmera (Tecla [S])
     bool rain_preview_toggle_triggered;  // Gatilho para simular/alternar chuva com gotas escorrendo na tela (Tecla [W])
+    bool privacy_toggle_triggered;       // Gatilho para ligar/desligar o Modo Privado (Tecla [L])
     AudioEventTrigger last_event;   // Último evento de áudio registrado
 };
 
@@ -194,6 +195,11 @@ struct SdSystemConfig {
     bool morning_briefing_enabled;  // Dispara resumo matinal automático ao sincronizar mundo externo
     bool diary_enabled;             // Diário do Bicho: eventos + resumos de capítulo/dia/semana no SD
     bool diary_store_transcripts;   // Grava no Diário o texto do que o humano disse por voz (false = só os temas)
+    bool privacy_mode;              // Modo privado ao ligar: não grava fotos/áudio/transcrições nem envia fotos à nuvem
+    uint32_t snapshots_max_files;   // Retenção: fotos mantidas no álbum
+    uint32_t tts_cache_max_mb;      // Retenção: teto do cache de voz (MB)
+    uint32_t log_max_lines;         // Retenção: linhas mantidas nos logs de fala/memória
+    uint32_t diary_keep_days;       // Retenção: dias de eventos/capítulos do Diário
 };
 
 struct PersistentPetData {
@@ -347,6 +353,7 @@ private:
     bool prev_key_k;
     bool prev_key_h;
     bool prev_key_w;
+    bool prev_key_l;
     bool simulated_presence_enabled;
     bool manual_meeting_override;
     uint16_t webcam_ambient_lux;
@@ -410,6 +417,10 @@ public:
     // Carrega ou cria o arquivo de configuração unificada sd_card/config.json
     bool loadOrInitSdConfig();
     const SdSystemConfig& getSdConfig() const;
+
+    // Modo privado em tempo de execução (tecla [L] no PC / config.json): suprime gravações pessoais no cartão
+    void setPrivacyMode(bool enabled);
+    bool isPrivacyMode() const;
 
     // Atualiza todas as leituras da HAL (deve ser chamado a cada frame)
     void updateSensors();

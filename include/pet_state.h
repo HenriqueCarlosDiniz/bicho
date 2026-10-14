@@ -9,6 +9,7 @@
 #include "world_context.h"
 #include "voice_synth_worker.h"
 #include "diary_service.h"
+#include "retention.h"
 
 // =============================================================================
 // Constantes de Tempo e Limiares da Máquina de Estados (Padrão UPPER_CASE)
@@ -283,7 +284,9 @@ private:
 
     // 6. Frase de voz aguardando o Oráculo ficar livre (áudio capturado no fim da frase, não depois)
     uint32_t pending_voice_until_ms;
-    uint32_t sfx_playback_until_ms;     // Fim do efeito sonoro atual: depois dele o barramento volta ao microfone
+    uint32_t sfx_playback_until_ms;
+    RetentionPolicy retention_policy;   // Limites do cartão (config.json)
+    bool privacy_mode;                  // Modo privado em vigor (espelha a HAL)     // Fim do efeito sonoro atual: depois dele o barramento volta ao microfone
     std::string pending_voice_wav_b64;
 
     // 7. Diário do Bicho (eventos + resumos no SD). Declarado após oracle_brain para ser destruído antes dele.
@@ -360,7 +363,8 @@ public:
     void applyOracleResponse(HalSensors& hal_sensors, const OracleResponsePayload& response_payload);
 
     // Inicia a fala procedural letra por letra com Lip-Sync e legenda gradual
-    void speakWithLipSync(HalSensors& hal_sensors, const char* reply_text);
+    // cache_voice=false para falas únicas do Gemini (o cache de voz fica só com as frases fixas)
+    void speakWithLipSync(HalSensors& hal_sensors, const char* reply_text, bool cache_voice = true);
 
     // Sorteia e fala uma apresentação ao ligar, evitando as frases ditas recentemente
     void speakStartupGreeting(HalSensors& hal_sensors);

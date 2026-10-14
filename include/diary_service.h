@@ -51,6 +51,10 @@ public:
     // Objeto JSON com "hoje até agora", "ontem" e "esta semana" para a telemetria do Oráculo
     std::string buildContextJson() const;
 
+    // Modo privado: conversas registradas sem transcrição e eventos sem conteúdo pessoal
+    void setPrivacyMode(bool enabled);
+    bool isPrivacyMode() const;
+
     bool isEnabled() const;
     bool storesTranscripts() const;
 
@@ -76,6 +80,7 @@ private:
     // Estado do dia (loop principal)
     bool enabled;
     bool store_transcripts;
+    bool privacy_mode = false;
     bool initialized;
     const OracleBrain* oracle_brain;
     std::string today_date;

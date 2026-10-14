@@ -15,6 +15,18 @@ bicho_sd/
 - Sem `config.json`, o Bicho cria um padrão a partir do `secrets.h` no primeiro boot.
 - `sfx/`, `ambient/` e `gfx/` são gerados automaticamente se estiverem vazios.
 
+### Privacidade e retenção (`config.json`)
+
+| Chave | Padrão | Efeito |
+|---|---|---|
+| `privacy_mode` | `false` | Liga o modo privado ao ligar (no PC, alterna com a tecla **[L]**): não grava fotos, notas de voz, transcrições nem memórias, e não envia fotos ao Gemini |
+| `snapshots_max_files` | `60` | Fotos mantidas no álbum (o mesmo limite vale para os quadros do timelapse) |
+| `tts_cache_max_mb` | `15` | Teto do cache de voz; só frases fixas são gravadas |
+| `log_max_lines` | `1000` | Linhas mantidas nos logs de fala e memória |
+| `diary_keep_days` | `30` | Dias de eventos e capítulos do Diário |
+
+A limpeza roda a cada boot, e o álbum também é podado a cada foto nova.
+
 ## Gravar e abrir o monitor serial
 
 ```
