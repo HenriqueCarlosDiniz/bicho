@@ -6,9 +6,18 @@ $ErrorActionPreference = "Stop"
 Write-Host "[BICHO] Compilando e iniciando o Emulador M5Stack CoreS3 (SDL2 a 60 FPS)..." -ForegroundColor Cyan
 
 # Garante o compilador MinGW e a DLL do SDL2 no PATH da sessao atual
-$mingwBin = Join-Path $env:USERPROFILE ".platformio\packages\toolchain-gccmingw32\bin"
-$sdl2Bin  = "C:\tools\SDL2-mingw\SDL2-2.30.10\i686-w64-mingw32\bin"
-$pyScripts = "C:\Users\henri\AppData\Local\Programs\Python\Python311\Scripts"
+$mingwBin  = Join-Path $env:USERPROFILE ".platformio\packages\toolchain-gccmingw32\bin"
+$sdl2Bin   = "C:\tools\SDL2-mingw\SDL2-2.30.10\i686-w64-mingw32\bin"
+$pyScripts = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\Scripts"
+if (-not (Test-Path $pyScripts)) {
+    $pyCmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($null -ne $pyCmd -and $null -ne $pyCmd.Source) {
+        $candidateScripts = Join-Path (Split-Path $pyCmd.Source -Parent) "Scripts"
+        if (Test-Path $candidateScripts) {
+            $pyScripts = $candidateScripts
+        }
+    }
+}
 
 $env:PATH = "$mingwBin;$sdl2Bin;$pyScripts;$env:PATH"
 

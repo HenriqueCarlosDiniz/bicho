@@ -5,6 +5,10 @@
 #include <cstring>
 #include <ctime>
 
+#if __has_include(<ArduinoJson.h>)
+#include <ArduinoJson.h>
+#endif
+
 #if defined(ARDUINO)
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -462,11 +466,29 @@ bool WorldContextService::fetchTechAndGeekTrivia(ExternalWorldContext& target_ct
         std::snprintf(poke_url, sizeof(poke_url), "%s%u", POKEAPI_POKEMON_PREFIX, static_cast<unsigned int>(poke_id));
         std::string poke_body;
         if (executeHttpGet(poke_url, poke_body)) {
-            // Na PokéAPI, "species":{"name":"..."} tem o nome limpo do Pokémon
-            size_t species_pos = poke_body.find("\"species\"");
             std::string poke_name;
-            if (species_pos != std::string::npos &&
-                parseJsonStringAfterKey(poke_body, "name", poke_name, species_pos)) {
+#if __has_include(<ArduinoJson.h>)
+            JsonDocument filter_doc;
+            filter_doc["name"] = true;
+            JsonDocument poke_doc;
+            if (deserializeJson(poke_doc, poke_body, DeserializationOption::Filter(filter_doc)) == DeserializationError::Ok &&
+                poke_doc["name"].is<const char*>()) {
+                poke_name = poke_doc["name"].as<const char*>();
+            }
+#endif
+            if (poke_name.empty()) {
+                // Em pokemon-species/{id}, a chave raiz "name" fica logo após "is_mythical"
+                size_t root_name_anchor = poke_body.find("\"is_mythical\"");
+                if (root_name_anchor == std::string::npos) {
+                    root_name_anchor = poke_body.find("\"species\"");
+                }
+                if (root_name_anchor != std::string::npos) {
+                    parseJsonStringAfterKey(poke_body, "name", poke_name, root_name_anchor);
+                } else {
+                    parseJsonStringAfterKey(poke_body, "name", poke_name);
+                }
+            }
+            if (!poke_name.empty()) {
                 char trivia_buf[128];
                 std::snprintf(trivia_buf, sizeof(trivia_buf), "Pokémon #%u sorteado: %s",
                               static_cast<unsigned int>(poke_id), poke_name.c_str());

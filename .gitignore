@@ -26,5 +26,9 @@ cam_snap_tmp.jpg
 face_track.txt
 face_track.tmp
 cam_pip*.raw
+cam_pip_hd.raw
+cam_pip_rgb565.raw
+cam_pip_hd_rgb565.raw
 cam_pip*.tmp
+*.tmp
 sd_card/

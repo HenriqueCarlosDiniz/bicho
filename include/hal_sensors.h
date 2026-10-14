@@ -36,6 +36,7 @@ constexpr uint8_t MIC_CAPTURE_CHANNELS = 1;
 constexpr uint16_t MIC_CAPTURE_BUFFER_FRAMES = 512;
 constexpr uint32_t MIC_RECORD_DURATION_SEC = 4;
 constexpr size_t MIC_RING_BUFFER_SAMPLES = MIC_CAPTURE_SAMPLE_RATE * MIC_RECORD_DURATION_SEC; // 64.000 amostras (4s)
+constexpr size_t MAX_VOICE_NOTES_FILES = 20; // Limite máximo de notas de voz arquivadas em sd_card/voice_notes/
 
 // Caminhos de arquivos temporários para Webcam e Persistência
 constexpr const char* PET_SAVE_FILE_PATH = "pet_save.json";
@@ -241,7 +242,7 @@ private:
     uint8_t dsp_clap_stage;
     uint32_t dsp_last_clap_ms;
     bool dsp_double_clap_latched;
-    uint32_t dsp_whistle_Accum_ms;
+    uint32_t dsp_whistle_accum_ms;
     uint32_t dsp_last_whistle_ms;
     bool dsp_whistle_latched;
     uint8_t dsp_typing_click_count;
@@ -375,7 +376,11 @@ public:
                                 size_t reply_buffer_size,
                                 PetEmotionState& out_target_emotion,
                                 int32_t& out_mood_delta,
-                                int32_t& out_energy_delta);
+                                int32_t& out_energy_delta,
+                                int32_t* out_hunger_delta = nullptr,
+                                std::string* out_new_memory = nullptr,
+                                std::string* out_permanent_fact = nullptr,
+                                std::string* out_memory_tags = nullptr);
 
     // Getters de leitura rápida (camelCase)
     const GazeTargetData& getGazeData() const;

@@ -46,7 +46,7 @@ constexpr const char* SCRYFALL_RANDOM_CARD_URL =
     "https://api.scryfall.com/cards/random";
 
 constexpr const char* POKEAPI_POKEMON_PREFIX =
-    "https://pokeapi.co/api/v2/pokemon/";
+    "https://pokeapi.co/api/v2/pokemon-species/";
 
 // =============================================================================
 // Estrutura de Dados do Estado do Mundo Externo (Padrão snake_case)
