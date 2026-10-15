@@ -3,7 +3,8 @@
 // PetController: efeitos sonoros, DSP emocional da voz, fala e lip-sync
 
 bool PetController::playSdSoundEffect(HalSensors& hal_sensors, const char* relative_sd_path) {
-    if (is_muted_indefinitely || relative_sd_path == nullptr || !oracle_brain.isSdStorageReady()) {
+    // Durante a conversa ao vivo o alto-falante é da voz Live (M5.Speaker.stop() cortaria a fala)
+    if (live_active || is_muted_indefinitely || relative_sd_path == nullptr || !oracle_brain.isSdStorageReady()) {
         return false;
     }
 
@@ -323,7 +324,7 @@ void PetController::stopSpeakingImmediately(HalSensors& hal_sensors, const char*
 }
 
 void PetController::speakWithLipSync(HalSensors& hal_sensors, const char* reply_text, bool cache_voice) {
-    if (reply_text == nullptr || reply_text[0] == '\0') {
+    if (live_active || reply_text == nullptr || reply_text[0] == '\0') {
         return;
     }
 

@@ -10,6 +10,8 @@
 #include "voice_synth_worker.h"
 #include "diary_service.h"
 #include "retention.h"
+#include "live_session.h"
+#include <deque>
 
 // =============================================================================
 // Constantes de Tempo e Limiares da Máquina de Estados (Padrão UPPER_CASE)
@@ -286,6 +288,24 @@ private:
     uint32_t pending_voice_until_ms;
     uint32_t sfx_playback_until_ms;
     RetentionPolicy retention_policy;   // Limites do cartão (config.json)
+
+    // Conversa ao vivo (API Live): voz contínua com interrupção e fim por silêncio
+    LiveSession live_session;
+    bool live_enabled;
+    bool live_active;
+    bool live_ready_logged;
+    std::string live_model;
+    std::string live_voice;
+    uint32_t live_idle_timeout_ms;
+    uint32_t live_retry_after_ms;
+    uint32_t live_started_ms;
+    uint32_t live_last_activity_ms;
+    std::string live_user_text;
+    std::string live_bot_text;
+    std::deque<std::vector<int16_t>> live_audio_blocks;
+    std::vector<int16_t> live_play_slots[3];
+    uint8_t live_slot_index;
+    float live_mouth_level;
     bool privacy_mode;                  // Modo privado em vigor (espelha a HAL)     // Fim do efeito sonoro atual: depois dele o barramento volta ao microfone
     std::string pending_voice_wav_b64;
 
@@ -318,6 +338,11 @@ private:
     void calculateLipSyncMouthHeight(uint32_t now_ms);
     int32_t clampStatValue(int32_t value, int32_t min_val, int32_t max_val) const;
     bool isDistractionWindow(const char* window_title) const;
+    bool isLiveAvailable() const;
+    bool startLiveSession(HalSensors& hal_sensors, const std::vector<int16_t>& phrase_pcm16k);
+    void updateLiveSession(HalSensors& hal_sensors, uint32_t now_ms);
+    void finishLiveTurn();
+    void endLiveSession(HalSensors& hal_sensors, const char* reason);
     void initVisorRainDrops();
     void updateVisorRainDrops(uint32_t now_ms);
     bool isRainingOnVisor() const;

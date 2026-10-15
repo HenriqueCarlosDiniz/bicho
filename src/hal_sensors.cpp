@@ -166,6 +166,7 @@ HalSensors::HalSensors()
       last_face_track_check_ms(0),
       last_pip_read_ms(0),
       webcam_tracker_active(false),
+      mic_streaming_enabled(false),
       test_wav_pos(0),
       test_wav_start_ms(0),
       test_wav_injecting(false),
@@ -218,6 +219,10 @@ HalSensors::HalSensors()
     sd_config.tts_cache_max_mb = 15;
     sd_config.log_max_lines = 1000;
     sd_config.diary_keep_days = 30;
+    sd_config.live_enabled = true;
+    std::snprintf(sd_config.live_model, sizeof(sd_config.live_model), "%s", "gemini-3.8-live");
+    std::snprintf(sd_config.live_voice, sizeof(sd_config.live_voice), "%s", "Orus");
+    sd_config.live_idle_timeout_s = 15;
     std::memset(pip_frame_gray, 0, sizeof(pip_frame_gray));
     std::memset(pip_hd_frame_gray, 0, sizeof(pip_hd_frame_gray));
     std::memset(pip_frame_rgb565, 0, sizeof(pip_frame_rgb565));
@@ -279,6 +284,10 @@ bool HalSensors::loadOrInitSdConfig() {
             cfg_doc["tts_cache_max_mb"] = sd_config.tts_cache_max_mb;
             cfg_doc["log_max_lines"] = sd_config.log_max_lines;
             cfg_doc["diary_keep_days"] = sd_config.diary_keep_days;
+            cfg_doc["live_enabled"] = sd_config.live_enabled;
+            cfg_doc["live_model"] = sd_config.live_model;
+            cfg_doc["live_voice"] = sd_config.live_voice;
+            cfg_doc["live_idle_timeout_s"] = sd_config.live_idle_timeout_s;
             std::string default_text;
             serializeJsonPretty(cfg_doc, default_text);
             if (storageWriteText(SD_CONFIG_FILE_PATH, default_text)) {
@@ -325,6 +334,10 @@ bool HalSensors::loadOrInitSdConfig() {
     sd_config.tts_cache_max_mb = readLimit("tts_cache_max_mb", sd_config.tts_cache_max_mb, 2U);
     sd_config.log_max_lines = readLimit("log_max_lines", sd_config.log_max_lines, 50U);
     sd_config.diary_keep_days = readLimit("diary_keep_days", sd_config.diary_keep_days, 2U);
+    sd_config.live_enabled = cfg_doc["live_enabled"] | sd_config.live_enabled;
+    copyNonEmpty("live_model", sd_config.live_model, sizeof(sd_config.live_model));
+    copyNonEmpty("live_voice", sd_config.live_voice, sizeof(sd_config.live_voice));
+    sd_config.live_idle_timeout_s = readLimit("live_idle_timeout_s", sd_config.live_idle_timeout_s, 5U);
 
     // Atualiza config.json antigos com as chaves novas (valores atuais/padrão), para as opções ficarem visíveis
     // (o toolchain do ESP32 compila em C++11: sem lambda genérica)
@@ -348,11 +361,15 @@ bool HalSensors::loadOrInitSdConfig() {
     ensureUintKey("tts_cache_max_mb", sd_config.tts_cache_max_mb);
     ensureUintKey("log_max_lines", sd_config.log_max_lines);
     ensureUintKey("diary_keep_days", sd_config.diary_keep_days);
+    ensureBoolKey("live_enabled", sd_config.live_enabled);
+    ensureUintKey("live_idle_timeout_s", sd_config.live_idle_timeout_s);
+    if (cfg_doc["live_model"].isNull()) { cfg_doc["live_model"] = sd_config.live_model; added_keys = true; }
+    if (cfg_doc["live_voice"].isNull()) { cfg_doc["live_voice"] = sd_config.live_voice; added_keys = true; }
     if (added_keys) {
         std::string upgraded;
         serializeJsonPretty(cfg_doc, upgraded);
         if (storageWriteText(SD_CONFIG_FILE_PATH, upgraded)) {
-            M5_LOGI("[SD-CFG] '%s' atualizado com as novas opcoes (diario, privacidade e retencao).", SD_CONFIG_FILE_PATH);
+            M5_LOGI("[SD-CFG] '%s' atualizado com as novas opcoes (diario, privacidade, retencao e conversa ao vivo).", SD_CONFIG_FILE_PATH);
         }
     }
 
@@ -367,6 +384,24 @@ bool HalSensors::loadOrInitSdConfig() {
 
 const SdSystemConfig& HalSensors::getSdConfig() const {
     return sd_config;
+}
+
+void HalSensors::setMicStreaming(bool enabled) {
+#if !defined(ARDUINO)
+    std::lock_guard<std::mutex> lock(mic_buffer_mutex);
+    mic_streaming_enabled = enabled;
+    mic_stream_pending.clear();
+#else
+    (void)enabled; // CoreS3: sessão Live ainda não suportada (fase 3)
+#endif
+}
+
+void HalSensors::takeMicStream(std::vector<int16_t>& out_samples) {
+    out_samples.clear();
+#if !defined(ARDUINO)
+    std::lock_guard<std::mutex> lock(mic_buffer_mutex);
+    out_samples.swap(mic_stream_pending);
+#endif
 }
 
 void HalSensors::setPrivacyMode(bool enabled) {
@@ -950,15 +985,16 @@ void HalSensors::switchAudioBusMode(AudioModeState desired_mode) {
     current_audio_mode = desired_mode;
 }
 
-std::string HalSensors::recordUserAudioWav() const {
-    std::vector<int16_t> pcm_samples;
+// Copia (e consome) a última frase do microfone em PCM 16 kHz: recorte do VAD + pre-roll
+bool HalSensors::recordUserAudioPcm(std::vector<int16_t>& pcm_samples) const {
+    pcm_samples.clear();
 #if defined(ARDUINO)
     std::unique_lock<std::recursive_mutex> ring_lock(sensor_mutex);
     const uint32_t phrase_audio_ms = pending_phrase_audio_ms; // Escrito pela task de percepção
     pending_phrase_audio_ms = 0U;
     size_t total_available = cores3_mic_filled ? MIC_RING_BUFFER_SAMPLES : cores3_mic_write_pos;
     if (total_available < (MIC_CAPTURE_SAMPLE_RATE / 2U)) {
-        return "";
+        return false;
     }
     pcm_samples.resize(total_available);
     if (cores3_mic_filled) {
@@ -977,7 +1013,7 @@ std::string HalSensors::recordUserAudioWav() const {
     const uint32_t phrase_audio_ms = pending_phrase_audio_ms;
     pending_phrase_audio_ms = 0U;
     if (!mic_capture_active) {
-        return "";
+        return false;
     }
 
     // 1. Copia os últimos 4 segundos (64.000 amostras de 16 bits = 128 KB) do buffer circular do microfone
@@ -987,7 +1023,7 @@ std::string HalSensors::recordUserAudioWav() const {
         size_t total_available = mic_ring_filled ? MIC_RING_BUFFER_SAMPLES : mic_ring_write_pos;
         if (total_available < (MIC_CAPTURE_SAMPLE_RATE / 2U)) {
             // Menos de 0.5s inédito capturado até o momento
-            return "";
+            return false;
         }
 
         pcm_samples.resize(total_available);
@@ -1024,6 +1060,14 @@ std::string HalSensors::recordUserAudioWav() const {
         }
     }
     if (pcm_samples.empty()) {
+        return false;
+    }
+    return true;
+}
+
+std::string HalSensors::recordUserAudioWav() const {
+    std::vector<int16_t> pcm_samples;
+    if (!recordUserAudioPcm(pcm_samples)) {
         return "";
     }
 
@@ -2002,6 +2046,14 @@ void HalSensors::processCapturedAudioSamples(const int16_t* samples, size_t samp
     // para o pre-roll da frase) e executa o DSP do Ouvido 2.0 só fora da guarda
     uint32_t now_ms = M5.millis();
     std::lock_guard<std::mutex> lock(mic_buffer_mutex);
+    if (mic_streaming_enabled && current_audio_mode == AUDIO_MODE_MIC) {
+        // Sessão Live: entrega todas as amostras novas (limitado a 4 s caso ninguém consuma)
+        mic_stream_pending.insert(mic_stream_pending.end(), samples, samples + sample_count);
+        if (mic_stream_pending.size() > MIC_CAPTURE_SAMPLE_RATE * 4U) {
+            mic_stream_pending.erase(mic_stream_pending.begin(),
+                                     mic_stream_pending.end() - MIC_CAPTURE_SAMPLE_RATE * 4U);
+        }
+    }
     if (current_audio_mode == AUDIO_MODE_MIC) {
         for (size_t i = 0; i < sample_count; ++i) {
             mic_ring_buffer[mic_ring_write_pos] = samples[i];

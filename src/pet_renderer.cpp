@@ -1491,7 +1491,9 @@ void PetController::renderTacticalDialogueOverlay(M5Canvas& canvas, const char* 
     canvas.setTextSize(1);
     canvas.setTextColor((waiting_ai || is_muted_now || privacy_mode) ? COLOR_CYBER_ORANGE : COLOR_CYBER_ICE_LIGHT);
     canvas.setCursor(rtab_x + (sd_gfx_ready ? 15 : 3), rtab_y + 2);
-    if (waiting_ai) {
+    if (live_active) {
+        canvas.print("[LIVE://AO_VIVO]");
+    } else if (waiting_ai) {
         canvas.print("[IA://GEMINI_2.5]");
     } else if (is_muted_now) {
         canvas.print("[MUDO://SHHH_ON]");

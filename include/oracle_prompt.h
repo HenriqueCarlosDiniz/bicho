@@ -74,6 +74,9 @@ struct OraclePromptInputs {
     int lens_index = -1;                        // -1 = sem lente
 };
 
+// Instrução de sistema da sessão Live (conversa falada): persona + regras + contexto em JSON
+std::string buildLiveSystemInstruction(const std::string& context_json);
+
 // JSON de telemetria enxuto para o gatilho (só os blocos do perfil)
 std::string buildOracleTelemetryJson(const OraclePromptInputs& inputs);
 

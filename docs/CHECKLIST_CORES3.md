@@ -27,6 +27,17 @@ bicho_sd/
 
 A limpeza roda a cada boot, e o álbum também é podado a cada foto nova.
 
+### Conversa ao vivo (`config.json`)
+
+| Chave | Padrão | Efeito |
+|---|---|---|
+| `live_enabled` | `true` | Ao detectar uma frase dirigida ao Bicho, abre uma sessão da API Live do Gemini: conversa falada contínua, com interrupção, até ~15 s de silêncio. **Por enquanto só no emulador do PC**; no CoreS3 o Bicho segue usando o fluxo HTTP |
+| `live_model` | `gemini-3.8-live` | Modelo da sessão Live |
+| `live_voice` | `Orus` | Voz da sessão Live |
+| `live_idle_timeout_s` | `15` | Segundos sem conversa até encerrar a sessão |
+
+Se a sessão falhar (cota da API, rede), o Bicho volta sozinho ao fluxo HTTP por 1 minuto.
+
 ## Gravar e abrir o monitor serial
 
 ```

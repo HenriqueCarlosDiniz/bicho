@@ -109,6 +109,21 @@ PetController::PetController()
       diary_service(),
       sfx_playback_until_ms(0),
       retention_policy(),
+      live_session(),
+      live_enabled(false),
+      live_active(false),
+      live_ready_logged(false),
+      live_model(),
+      live_voice(),
+      live_idle_timeout_ms(15000U),
+      live_retry_after_ms(0),
+      live_started_ms(0),
+      live_last_activity_ms(0),
+      live_user_text(),
+      live_bot_text(),
+      live_audio_blocks(),
+      live_slot_index(0),
+      live_mouth_level(0.0f),
       privacy_mode(false),
       pending_voice_wav_b64(),
       voice_worker(),
@@ -222,6 +237,13 @@ void PetController::restorePersistentState(HalSensors& hal_sensors) {
     retention_policy.diary_keep_days = sd_cfg.diary_keep_days;
     oracle_brain.setRetentionPolicy(retention_policy);
     runStorageRetention(retention_policy);
+
+    live_enabled = sd_cfg.live_enabled && isLiveTransportSupported() && !oracle_brain.getApiKey().empty();
+    live_model = sd_cfg.live_model;
+    live_voice = sd_cfg.live_voice;
+    live_idle_timeout_ms = sd_cfg.live_idle_timeout_s * 1000U;
+    M5_LOGI("[LIVE] Conversa ao vivo %s (modelo %s).", live_enabled ? "DISPONIVEL" : "INDISPONIVEL (usa HTTP)",
+            live_model.c_str());
 
     privacy_mode = sd_cfg.privacy_mode;
     oracle_brain.setPrivacyMode(privacy_mode);
@@ -896,7 +918,14 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
 
     // Ouvido: captura o WAV da frase assim que o VAD a encerra. Se o Oráculo estiver ocupado/em cooldown,
     // a frase espera até VOICE_PENDING_MAX_WAIT_MS em vez de ser descartada.
-    if (audio_data.vad_phrase_completed) {
+    if (audio_data.vad_phrase_completed && !live_active && isLiveAvailable()) {
+        std::vector<int16_t> phrase_pcm;
+        hal_sensors.recordUserAudioPcm(phrase_pcm);
+        oracle_brain.recordHabitVoiceInteraction();
+        if (!startLiveSession(hal_sensors, phrase_pcm)) {
+            spawnHudPopup("SEM AO VIVO", 120.0f, 44.0f, COLOR_CYBER_ORANGE, 1800U);
+        }
+    } else if (audio_data.vad_phrase_completed && !live_active) {
         pending_voice_wav_b64 = hal_sensors.recordUserAudioWav();
         pending_voice_until_ms = now_ms + VOICE_PENDING_MAX_WAIT_MS;
         spawnHudPopup("OUVI!", 140.0f, 44.0f, COLOR_CYBER_ICE_LIGHT, 900U);
@@ -909,7 +938,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
 
     // 3. Camada 2: Gatilho do Cérebro Multimodal (Toque, Voz, Objeto na Lente, Intruso, Bocejo, Postura, Celular, Briefing)
     // Mesmo em Modo Silêncio (is_muted_indefinitely), o Bicho continua interagindo e falando por texto na tela!
-    if (!oracle_brain.isWaitingAi() && (now_ms - last_oracle_trigger_ms > ORACLE_COOLDOWN_MS)) {
+    if (!live_active && !oracle_brain.isWaitingAi() && (now_ms - last_oracle_trigger_ms > ORACLE_COOLDOWN_MS)) {
         std::string world_trigger;
         const ExternalWorldContext& world_ctx = world_context_service.getWorldContext();
 
@@ -1022,7 +1051,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     // Não fala por cima do usuário: segura a resposta enquanto o VAD mede uma frase em andamento
     // (se essa frase virar uma nova pergunta, a nova consulta substitui a resposta retida)
     OracleBrainResponse brain_result;
-    if (!audio_data.vad_speech_active && pending_voice_until_ms == 0U &&
+    if (!live_active && !audio_data.vad_speech_active && pending_voice_until_ms == 0U &&
         oracle_brain.pollCompletedResponse(brain_result)) {
         // Briefing fala do mundo, não do humano: guardar "executei o briefing" só realimentava o mesmo estilo
         const bool is_briefing = (oracle_brain.getLastTriggerReason() == "DAILY_BRIEFING");
@@ -1089,6 +1118,7 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
 
     // 4. Atualiza o motor de Lip-Sync (WAV PCM via RMS ou fallback procedural) antes da interpolação facial
     updateLipSyncStep(hal_sensors, now_ms);
+    updateLiveSession(hal_sensors, now_ms);
 
     // 5. Atualiza alvos da geometria facial e executa Easing (interpolação suave)
     computeTargetFacePose(gaze_data, now_ms);

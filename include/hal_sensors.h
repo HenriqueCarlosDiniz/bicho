@@ -200,6 +200,10 @@ struct SdSystemConfig {
     uint32_t tts_cache_max_mb;      // Retenção: teto do cache de voz (MB)
     uint32_t log_max_lines;         // Retenção: linhas mantidas nos logs de fala/memória
     uint32_t diary_keep_days;       // Retenção: dias de eventos/capítulos do Diário
+    bool live_enabled;              // Conversa em tempo real pela API Live (PC; no CoreS3 ainda usa HTTP)
+    char live_model[48];            // Modelo Live (ex.: gemini-3.8-live)
+    char live_voice[24];            // Voz da sessão Live (ex.: Orus)
+    uint32_t live_idle_timeout_s;   // Encerra a sessão após N s sem conversa
 };
 
 struct PersistentPetData {
@@ -371,6 +375,8 @@ private:
     uint32_t last_face_track_check_ms;
     uint32_t last_pip_read_ms;
     bool webcam_tracker_active;
+    bool mic_streaming_enabled;                 // Protegido por mic_buffer_mutex
+    std::vector<int16_t> mic_stream_pending;
 
     // Ferramentas de diagnóstico do Ouvido no emulador:
     //   BICHO_TEST_WAV=arquivo.wav (16 kHz, mono, 16 bit) injeta o áudio como se fosse o microfone
@@ -431,6 +437,11 @@ public:
 
     // Grava 4 segundos das amostras PCM capturadas pelo microfone em WAV e codifica em Base64
     std::string recordUserAudioWav() const;
+    bool recordUserAudioPcm(std::vector<int16_t>& out_pcm16k) const;
+
+    // Sessão Live: entrega contínua do microfone (PCM 16 kHz) enquanto habilitada
+    void setMicStreaming(bool enabled);
+    void takeMicStream(std::vector<int16_t>& out_samples);
 
     // Captura 1 frame 320x240 em JPEG da webcam/GC0308 e codifica em Base64 para o Gemini
     std::string captureCameraJpegBase64() const;

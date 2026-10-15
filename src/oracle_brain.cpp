@@ -788,6 +788,25 @@ bool OracleBrain::requestTextCompletion(const std::string& system_instruction,
     return executePlatformHttpsPost(payload, out_raw_response, GEMINI_DIARY_REQ_TEMP_FILE, GEMINI_DIARY_RESP_TEMP_FILE, 25);
 }
 
+std::string OracleBrain::getApiKey() const {
+    return resolveApiKey();
+}
+
+std::string OracleBrain::buildLiveSystemInstructionFor(const OracleContextPacket& context_packet) const {
+    OracleContextPacket voice_packet = context_packet;
+    voice_packet.trigger_reason = "VOICE_HANDS_FREE";
+    return buildLiveSystemInstruction(buildTelemetryJsonString(voice_packet));
+}
+
+void OracleBrain::recordLiveTurn(const std::string& user_said, const std::string& reply_text) {
+    if (reply_text.empty()) {
+        return;
+    }
+    rememberRecentReply(reply_text);
+    rememberConversationTurn(user_said, reply_text);
+    recordSpokenPhraseToSd(reply_text, "GEMINI_LIVE", "LIVE_CONVERSATION");
+}
+
 const std::string& OracleBrain::getLastTriggerReason() const {
     return trigger_reason;
 }

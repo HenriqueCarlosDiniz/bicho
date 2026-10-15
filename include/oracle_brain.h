@@ -222,6 +222,11 @@ public:
                                const std::string& user_text,
                                std::string& out_raw_response) const;
 
+    // Sessão Live: chave da API, instrução de sistema com o contexto atual e registro de cada troca falada
+    std::string getApiKey() const;
+    std::string buildLiveSystemInstructionFor(const OracleContextPacket& context_packet) const;
+    void recordLiveTurn(const std::string& user_said, const std::string& reply_text);
+
     // Motivo do último gatilho enviado ao Cérebro (para registrar a resposta no Diário)
     const std::string& getLastTriggerReason() const;
     const std::vector<std::string>& getPermanentProfileFacts() const;
