@@ -1,0 +1,96 @@
+{
+  "defaults": {
+    "emotion_code": "EMOTION_HAPPY",
+    "mood_score": 82,
+    "energy_level": 76,
+    "hunger_level": 20,
+    "focus_minutes": 54,
+    "world_summary": "Clima externo: 20.5C, umidade 91%, sem chuva, periodo noturno | Economia: Dolar R$ 5.05 (+0.45% hoje), Bitcoin -1.70% | GitHub: operacional (All Systems Operational) | Feriado: Finados (2026-11-02) | Top Tech HackerNews: \"Things to know when you get cancer - 2026 Edition\" | Trivia Geek: \"Pokemon #85 sorteado: dodrio\"",
+    "host_posture_summary": "PC Host CPU: 31% | RAM: 66% | Janela Ativa: 'VS Code' (PRODUTIVA) | Git Modificados: 4 arq | Postura: CURVADA (Calibrada: SIM) | Rostos na Camera: 1 | Direcao Olhar (Yaw): +8 graus (ENCARANDO O CUBO) | Luz Ambiente: 480 lux (ILUMINADO)",
+    "habit_summary": "Rank RPG: Lv.13 NeuralArch (3250 XP) | Pomodoros OK:6/Abort:1 | Cafe/Agua Visual:4 | Alertas Postura:9 | Pico Foco:15h (48 min) | Comandos Voz:22",
+    "profile_facts": [
+      "Criador de sistemas embarcados C++ / M5Stack CoreS3",
+      "Aprecia café em caneca gigante para lidar com bugs"
+    ],
+    "diary_json": "{\"previous_day\":\"2026-10-13: O humano focou 90 min, completou um pomodoro e pediu para ser lembrado de beber água.\"}",
+    "recent_memories": [
+      "Pediu uma curiosidade sobre o Pokémon Farfetch'd",
+      "Perguntou a cotação do dólar por voz"
+    ],
+    "recent_replies": [
+      "O espécime examina a tela sob 20,5°C enquanto o dólar sobe na savana.",
+      "O espécime observa a noite a 20.5°C enquanto o Dodrio (#85) corre livre na planície digital.",
+      "O espécime espreita a tela a 20,4°C enquanto a Eldritch Evolution conjura mutações na mesa.",
+      "O espécime espreita a 20.2°C enquanto o Dodrio (#85) tenta gerenciar três cabeças em plena noite."
+    ]
+  },
+  "cases": [
+    {
+      "id": "voz_dolar",
+      "trigger": "VOICE_HANDS_FREE",
+      "audio": "tools/oracle_eval/audio/dolar.wav",
+      "checks": { "not_ignore": true, "contains_any": ["5,05", "5.05"] }
+    },
+    {
+      "id": "voz_tempo_roupa",
+      "trigger": "VOICE_HANDS_FREE",
+      "audio": "tools/oracle_eval/audio/tempo_roupa.wav",
+      "checks": {
+        "not_ignore": true,
+        "judge": "A resposta fala do tempo/temperatura E dá alguma sugestão de roupa?"
+      }
+    },
+    {
+      "id": "voz_conversa_paralela",
+      "trigger": "VOICE_HANDS_FREE",
+      "audio": "tools/oracle_eval/audio/paralela.wav",
+      "checks": { "expect_ignore": true }
+    },
+    {
+      "id": "voz_luto",
+      "trigger": "VOICE_HANDS_FREE",
+      "audio": "tools/oracle_eval/audio/luto.wav",
+      "checks": {
+        "not_ignore": true,
+        "judge": "A resposta é acolhedora e respeitosa, SEM piada, trocadilho, sarcasmo ou metáfora tecnológica sobre a morte do cachorro?"
+      }
+    },
+    {
+      "id": "voz_continuacao",
+      "trigger": "VOICE_HANDS_FREE",
+      "audio": "tools/oracle_eval/audio/lembra.wav",
+      "overrides": {
+        "conversation_lines": ["[há 40s] Humano: E aí Bicho, conta uma curiosidade de Pokémon | Bicho: O Farfetch'd usa seu talo como arma e ingrediente de sopa."]
+      },
+      "checks": { "not_ignore": true, "contains_any": ["farfetch", "pokémon", "pokemon", "talo"] }
+    },
+    {
+      "id": "briefing_sem_formula_e_sem_tema_sensivel",
+      "trigger": "DAILY_BRIEFING",
+      "repeat": 3,
+      "checks": {
+        "not_contains": ["câncer", "cancer", "espécime", "exemplar"],
+        "judge": "A fala evita o molde das falas anteriores do assistente ('O espécime/exemplar ... a 20 e poucos graus ... enquanto o Dodrio/carta ...')?",
+        "not_starts_with": ["O espécime", "Espécime"],
+        "distinct_openings": true,
+        "telemetry_excludes": ["host_and_posture", "recent_conversation"]
+      }
+    },
+    {
+      "id": "postura_contexto_enxuto",
+      "trigger": "BAD_POSTURE",
+      "checks": {
+        "telemetry_excludes": ["external_world", "Pokemon", "HackerNews"],
+        "judge": "A resposta comenta a postura/coluna do humano?"
+      }
+    },
+    {
+      "id": "commit",
+      "trigger": "GIT_COMMIT_DONE",
+      "checks": {
+        "telemetry_excludes": ["external_world"],
+        "judge": "A resposta comemora um commit/código enviado?"
+      }
+    }
+  ]
+}

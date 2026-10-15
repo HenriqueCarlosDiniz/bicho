@@ -1024,7 +1024,9 @@ void PetController::updateController(HalSensors& hal_sensors, uint32_t now_ms) {
     OracleBrainResponse brain_result;
     if (!audio_data.vad_speech_active && pending_voice_until_ms == 0U &&
         oracle_brain.pollCompletedResponse(brain_result)) {
-        if (!brain_result.new_memory.empty() || !brain_result.permanent_fact.empty()) {
+        // Briefing fala do mundo, não do humano: guardar "executei o briefing" só realimentava o mesmo estilo
+        const bool is_briefing = (oracle_brain.getLastTriggerReason() == "DAILY_BRIEFING");
+        if (!is_briefing && (!brain_result.new_memory.empty() || !brain_result.permanent_fact.empty())) {
             oracle_brain.addStructuredMemory(
                 brain_result.new_memory,
                 brain_result.permanent_fact,

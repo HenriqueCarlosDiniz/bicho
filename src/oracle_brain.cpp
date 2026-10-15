@@ -92,7 +92,7 @@ OracleBrain::OracleBrain()
       sd_storage_ready(false),
       trigger_reason("TOUCH_POKE"),
       fallback_cursor(0),
-      creative_lens_cursor(0),
+      last_creative_lens(-1),
       is_waiting_ai(false),
       has_pending_response(false)
 {
@@ -284,209 +284,59 @@ std::string OracleBrain::truncateUtf8Reply(const std::string& text_utf8, size_t 
 }
 
 std::string OracleBrain::buildTelemetryJsonString(const OracleContextPacket& context_packet) const {
-    char telemetry_buf[560];
-    std::snprintf(
-        telemetry_buf,
-        sizeof(telemetry_buf),
-        "{\"current_emotion\":\"%s\",\"mood_score\":%d,\"energy_level\":%d,\"hunger_level\":%d,"
-        "\"focus_minutes\":%u,\"noise_level_db\":%.1f,\"is_user_present\":%s,"
-        "\"is_in_meeting\":%s,\"is_charging\":%s,\"vad_keyword_mode\":%s,\"trigger_reason\":\"%s\"",
-        emotionToCodeString(context_packet.current_emotion),
-        static_cast<int>(context_packet.mood_score),
-        static_cast<int>(context_packet.energy_level),
-        static_cast<int>(context_packet.hunger_level),
-        static_cast<unsigned int>(context_packet.focus_minutes),
-        context_packet.noise_level_db,
-        context_packet.is_user_present ? "true" : "false",
-        context_packet.is_in_meeting ? "true" : "false",
-        context_packet.is_charging ? "true" : "false",
-        context_packet.vad_keyword_mode ? "true" : "false",
-        escapeJsonString(context_packet.trigger_reason).c_str()
-    );
-
-    std::string telemetry_json(telemetry_buf);
-    if (!context_packet.external_world_summary.empty()) {
-        telemetry_json += ",\"external_world_summary\":\"" +
-                          escapeJsonString(context_packet.external_world_summary) + "\"";
-    }
-    if (!context_packet.host_and_posture_summary.empty()) {
-        telemetry_json += ",\"host_and_posture_summary\":\"" +
-                          escapeJsonString(context_packet.host_and_posture_summary) + "\"";
-    }
-
-    // Injeção da Matriz Estatística de Hábitos do Cartão SD
-    std::string habit_summary = buildHabitMatrixSummary();
-    if (!habit_summary.empty()) {
-        telemetry_json += ",\"user_habit_profile\":\"" + escapeJsonString(habit_summary) + "\"";
-    }
-
-    // Nível 1 do SD: Perfil Permanente do Usuário
-    if (!permanent_profile_facts.empty()) {
-        telemetry_json += ",\"permanent_user_profile\":[";
-        for (size_t i = 0; i < permanent_profile_facts.size(); ++i) {
-            if (i > 0) telemetry_json += ",";
-            telemetry_json += "\"" + escapeJsonString(permanent_profile_facts[i]) + "\"";
-        }
-        telemetry_json += "]";
-    }
-
-    // Diário do Bicho: hoje até agora, ontem e esta semana (resumos reais gerados pelo DiaryService)
-    if (!context_packet.diary_context_json.empty()) {
-        telemetry_json += ",\"diary\":" + context_packet.diary_context_json;
-    }
-
-    // Nível 3 do SD (legado): Resumos Diários Consolidados — só quando o Diário ainda não tem dados
-    if (context_packet.diary_context_json.empty() && !daily_summaries.empty()) {
-        telemetry_json += ",\"daily_summaries\":[";
-        for (size_t i = 0; i < daily_summaries.size(); ++i) {
-            if (i > 0) telemetry_json += ",";
-            char sum_buf[220];
-            std::snprintf(sum_buf, sizeof(sum_buf), "[%s | %u eventos | humor %d%%] %s",
-                          daily_summaries[i].date_str.c_str(),
-                          static_cast<unsigned int>(daily_summaries[i].total_events),
-                          static_cast<int>(daily_summaries[i].avg_mood_score),
-                          daily_summaries[i].highlight_fact.c_str());
-            telemetry_json += "\"" + escapeJsonString(sum_buf) + "\"";
-        }
-        telemetry_json += "]";
-    }
-
-    // Nível 2 + Micro-RAG no Cartão SD: Busca memórias antigas relevantes para o contexto atual
-    std::vector<std::string> rag_matches = retrieveRelevantMemories(context_packet);
-    if (!rag_matches.empty()) {
-        telemetry_json += ",\"relevant_past_memories_sd\":[";
-        for (size_t i = 0; i < rag_matches.size(); ++i) {
-            if (i > 0) telemetry_json += ",";
-            telemetry_json += "\"" + escapeJsonString(rag_matches[i]) + "\"";
-        }
-        telemetry_json += "]";
-    }
+    // Reúne os dados; o que entra de fato no prompt é decidido por gatilho em oracle_prompt.cpp
+    OraclePromptInputs in;
+    in.trigger_reason = context_packet.trigger_reason;
+    in.emotion_code = emotionToCodeString(context_packet.current_emotion);
+    in.mood_score = context_packet.mood_score;
+    in.energy_level = context_packet.energy_level;
+    in.hunger_level = context_packet.hunger_level;
+    in.focus_minutes = context_packet.focus_minutes;
+    in.noise_level_db = context_packet.noise_level_db;
+    in.is_user_present = context_packet.is_user_present;
+    in.is_in_meeting = context_packet.is_in_meeting;
+    in.is_charging = context_packet.is_charging;
+    in.vad_keyword_mode = context_packet.vad_keyword_mode;
+    in.has_audio = !context_packet.wav_base64.empty();
+    in.world_summary = context_packet.external_world_summary;
+    in.host_posture_summary = context_packet.host_and_posture_summary;
+    in.habit_summary = buildHabitMatrixSummary();
+    in.profile_facts = permanent_profile_facts;
+    in.diary_json = context_packet.diary_context_json;
+    in.relevant_memories = retrieveRelevantMemories(context_packet);
+    in.recent_memories = recent_memories;
+    in.recent_replies = recent_replies;
 
     // Memória curta da conversa por voz: o que o humano disse e o que o Bicho respondeu (últimos minutos)
-    {
-        const uint32_t now_ms = M5.millis();
-        std::string convo_json;
-        for (const ConversationTurn& turn : conversation_history) {
-            const uint32_t age_ms = now_ms - turn.at_ms;
-            if (age_ms > CONVERSATION_MEMORY_MS) {
-                continue;
-            }
-            char age_buf[32];
-            if (age_ms < 60000U) {
-                std::snprintf(age_buf, sizeof(age_buf), "há %us", static_cast<unsigned int>(age_ms / 1000U));
-            } else {
-                std::snprintf(age_buf, sizeof(age_buf), "há %u min", static_cast<unsigned int>(age_ms / 60000U));
-            }
-            if (!convo_json.empty()) convo_json += ",";
-            convo_json += "\"" + escapeJsonString(std::string("[") + age_buf + "] Humano: " + turn.user_said +
-                                                   " | Bicho: " + turn.reply_text) + "\"";
+    const uint32_t now_ms = M5.millis();
+    for (const ConversationTurn& turn : conversation_history) {
+        const uint32_t age_ms = now_ms - turn.at_ms;
+        if (age_ms > CONVERSATION_MEMORY_MS) {
+            continue;
         }
-        if (!convo_json.empty()) {
-            telemetry_json += ",\"recent_conversation\":[" + convo_json + "]";
-        }
-    }
-
-    telemetry_json += ",\"recent_memories\":[";
-    for (size_t i = 0; i < recent_memories.size(); ++i) {
-        if (i > 0) {
-            telemetry_json += ",";
-        }
-        telemetry_json += "\"" + escapeJsonString(recent_memories[i]) + "\"";
-    }
-    telemetry_json += "]";
-
-    // Lista de falas recentes proibidas para impedir loops e repetição de piadas/temas
-    if (!recent_replies.empty()) {
-        telemetry_json += ",\"forbidden_recent_replies_do_not_repeat\":[";
-        for (size_t i = 0; i < recent_replies.size(); ++i) {
-            if (i > 0) telemetry_json += ",";
-            telemetry_json += "\"" + escapeJsonString(recent_replies[i]) + "\"";
-        }
-        telemetry_json += "]";
-    }
-
-    // Lente Criativa Rotativa + Diretriz específica do gatilho para garantir alta variedade temática
-    static const char* const CREATIVE_LENSES[] = {
-        "Estilo Narrador da Vida Selvagem (National Geographic): descreva o humano na bancada como um espécime raro em seu habitat natural.",
-        "Estilo IA de Nave Espacial Sci-Fi (TARS/HAL-9000 bem-humorado): trate o quarto como uma estação orbital e comente telemetria ou clima externo.",
-        "Estilo Engenheiro de Corrida de Fórmula 1 no rádio (Box, Box!): trate a sessão de trabalho, postura ou hidratação como estratégia de pista e desgaste de pneus.",
-        "Estilo Detetive Noir Cyberpunk: faça uma observação perspicaz sobre a expressão facial na câmera, a iluminação do ambiente ou o mistério na tela.",
-        "Estilo Mestre de RPG / Crônicas Épicas: narre o momento atual do humano (nível RPG, foco, clima ou trivia geek) como uma quest lendária.",
-        "Estilo Crítico Cultural & Geek Sagaz: conecte a manchete do HackerNews, a trivia geek do dia ou o dólar/Bitcoin com a cara do humano na câmera.",
-        "Estilo Sommelier de Cafeína & Ergonomia: avalie o nível de energia visual do humano, se há caneca/copo na mesa e sugira um pit-stop digno.",
-        "Estilo Filósofo Existencialista de Silício: reflita com ironia leve sobre viver num cubo de 2 polegadas observando humanos digitarem."
-    };
-    constexpr uint32_t LENS_COUNT = sizeof(CREATIVE_LENSES) / sizeof(CREATIVE_LENSES[0]);
-    const char* chosen_lens = CREATIVE_LENSES[creative_lens_cursor % LENS_COUNT];
-    ++creative_lens_cursor;
-
-    std::string trigger_focus = "Comente algo visualmente curioso da câmera ou do mundo externo.";
-    if (context_packet.trigger_reason == "DAILY_BRIEFING") {
-        trigger_focus = "BRIEFING DO DIA: Comente de forma criativa o clima externo, cotação do Dólar/BTC, a notícia do HackerNews ou a Trivia Geek! NÃO fale de compilador.";
-    } else if (context_packet.trigger_reason == "TOUCH_POKE") {
-        trigger_focus = "CUTUCÃO NA TELA: O humano clicou em você! Observe a expressão dele na câmera, o ambiente ao fundo ou faça uma piada sobre o toque físico.";
-    } else if (context_packet.trigger_reason == "VOICE_HANDS_FREE" || context_packet.trigger_reason == "VOICE_COMMAND") {
-        if (context_packet.vad_keyword_mode && context_packet.trigger_reason == "VOICE_HANDS_FREE") {
-            trigger_focus = "VOZ HANDS-FREE (MODO PALAVRA-CHAVE 'BICHO'): Transcreva a fala em 'user_said'. Se o humano chamou por 'Bicho', 'Ei Bicho', 'Oráculo', 'Cubo' ou falou claramente com você, responda AO CONTEÚDO do que ele disse (não comente telemetria aleatória). Se for conversa paralela com outra pessoa ou ruído, retorne reply_text='IGNORE'.";
+        char age_buf[32];
+        if (age_ms < 60000U) {
+            std::snprintf(age_buf, sizeof(age_buf), "há %us", static_cast<unsigned int>(age_ms / 1000U));
         } else {
-            trigger_focus = "VOZ DO HUMANO: Transcreva a fala em 'user_said' e responda diretamente ao conteúdo do que ele acabou de dizer, com sagacidade.";
+            std::snprintf(age_buf, sizeof(age_buf), "há %u min", static_cast<unsigned int>(age_ms / 60000U));
         }
-    } else if (context_packet.trigger_reason == "OVERWORK") {
-        trigger_focus = "EXCESSO DE FOCO: Convide o humano para esticar as pernas ou beber água usando uma metáfora totalmente nova.";
-    } else if (context_packet.trigger_reason == "PHONE_DOOMSCROLL") {
-        trigger_focus = "OLHANDO CELULAR: Provoque com bom humor o humano hipnotizado pela telinha vertical.";
-    } else if (context_packet.trigger_reason == "BAD_POSTURE") {
-        trigger_focus = "POSTURA: Brinque de forma criativa com a geometria da coluna do humano na câmera.";
-    } else if (context_packet.trigger_reason == "OBJECT_INSPECTION") {
-        trigger_focus = "INSPEÇÃO DE OBJETO NA LENTE: O humano aproximou um objeto da câmera (caneca de café, copo d'água, lanche, placa de hardware ou celular)! Identifique visualmente o que ele está mostrando na foto e reaja com entusiasmo geek.";
-    } else if (context_packet.trigger_reason == "INTRUDER_DETECTED") {
-        trigger_focus = "INTRUSO / SEGUNDO ROSTO NA CÂMERA: Há 2 ou mais pessoas no enquadramento! Comente sobre o visitante/espião atrás do humano ou pergunte se é sessão de pair programming.";
-    } else if (context_packet.trigger_reason == "YAWN_FATIGUE") {
-        trigger_focus = "BOCEJO / FADIGA VISUAL: O humano acabou de bocejar na câmera! Sugira café expresso, água gelada ou um cochilo tático antes que ele durma no teclado.";
-    } else if (context_packet.trigger_reason == "NIGHT_OWL_DARK") {
-        trigger_focus = "MODO CORUJÃO (QUARTO ESCURO): A iluminação caiu (< 25 lux)! Comente sobre programar nas sombras como um hacker de filme ou sugira ligar uma luz indireta.";
-    } else if (context_packet.trigger_reason == "GIT_COMMIT_DONE") {
-        trigger_focus = "GIT COMMIT REALIZADO: O contador de arquivos modificados no Git caiu para zero! Comemore com humor geek/sarcástico o código recém-commitado (+50 XP ganhos) e torça para não quebrar a produção.";
-    } else if (context_packet.trigger_reason == "END_OF_SHIFT_DEBRIEF") {
-        trigger_focus = "ENCERRAMENTO DE EXPEDIENTE (DEBRIEFING DIÁRIO): Fim de tarde na bancada! Faça um balanço carismático e bem-humorado da missão diária do humano (minutos de foco, nível RPG, posturas e cafés) encerrando o turno.";
+        in.conversation_lines.push_back(std::string("[") + age_buf + "] Humano: " + turn.user_said +
+                                        " | Bicho: " + turn.reply_text);
     }
 
-    // Em conversa por voz a lente criativa aleatória atrapalha (o modelo comentava a trivia em vez de responder)
-    const bool is_voice_turn = !context_packet.wav_base64.empty();
-    const std::string lens_text = is_voice_turn
-        ? std::string("CONVERSA: responda ao que o humano disse no áudio, com o seu humor de sempre")
-        : std::string(chosen_lens);
-    telemetry_json += ",\"creative_lens_directive\":\"" +
-                      escapeJsonString(lens_text + " | FOCO DO GATILHO: " + trigger_focus) + "\"}";
-    return telemetry_json;
+    // Lente criativa sorteada (antes o cursor começava em 0 a cada boot e o briefing caía sempre na mesma)
+    const uint32_t seed = static_cast<uint32_t>(std::time(nullptr)) * 2654435761U ^ (now_ms * 40503U);
+    in.lens_index = static_cast<int>(chooseCreativeLens(seed, last_creative_lens));
+    last_creative_lens = in.lens_index;
+
+    return buildOracleTelemetryJson(in);
 }
 
 std::string OracleBrain::buildGeminiRequestPayload(const OracleContextPacket& context_packet) const {
     std::string telemetry_context = context_packet.prebuilt_telemetry_json.empty()
                                         ? buildTelemetryJsonString(context_packet)
                                         : context_packet.prebuilt_telemetry_json;
-    std::string escaped_system = escapeJsonString(ORACLE_SYSTEM_PROMPT);
-    std::string escaped_telemetry = escapeJsonString(telemetry_context);
-
-    std::string payload = "{";
-    payload += "\"system_instruction\":{\"parts\":[{\"text\":\"" + escaped_system + "\"}]},";
-    payload += "\"contents\":[{\"role\":\"user\",\"parts\":[";
-    payload += "{\"text\":\"TELEMETRIA_ATUAL_E_MEMORIA: " + escaped_telemetry + "\"}";
-
-    // Anexa snapshot de câmera em Base64 se disponível (Percepção Multimodal)
-    if (!context_packet.jpeg_base64.empty()) {
-        payload += ",{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + context_packet.jpeg_base64 + "\"}}";
-    }
-
-    // Anexa trecho de áudio em Base64 se disponível
-    if (!context_packet.wav_base64.empty()) {
-        payload += ",{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"" + context_packet.wav_base64 + "\"}}";
-    }
-
-    payload += "]}],";
-    payload += "\"generationConfig\":{\"response_mime_type\":\"application/json\",\"temperature\":1.0,\"maxOutputTokens\":360}";
-    payload += "}";
-    return payload;
+    return buildOracleRequestPayload(telemetry_context, context_packet.jpeg_base64, context_packet.wav_base64);
 }
 
 // Leitura de campos de nível superior (respostas, config.json e linhas JSONL do SD) via ArduinoJson

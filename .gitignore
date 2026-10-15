@@ -37,3 +37,7 @@ cam_pip_hd_rgb565.raw
 cam_pip*.tmp
 *.tmp
 sd_card/
+
+# Arquivos temporarios da regressao do prompt
+oracle_eval_req.json*
+oracle_eval_resp.json
